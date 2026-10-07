@@ -59,6 +59,7 @@ Route::get('/integration/statistics', [StatisticsApiController::class, 'index'])
     ->middleware('statistics.api.key');
 
 Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/settings', [\App\Http\Controllers\Api\SettingController::class, 'index']);
     Route::post('/feedbacks', [FeedbackController::class, 'store']);
     
     Route::get('/link-hubs', [LinkHubController::class, 'index']);
@@ -106,6 +107,8 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('/locked-aliases', [LockedAliasController::class, 'index']);
             Route::post('/locked-aliases', [LockedAliasController::class, 'store']);
             Route::delete('/locked-aliases/{id}', [LockedAliasController::class, 'destroy']);
+
+            Route::put('/settings/{key}', [\App\Http\Controllers\Api\SettingController::class, 'update']);
         });
     });
 
