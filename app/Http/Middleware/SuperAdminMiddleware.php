@@ -4,11 +4,10 @@ namespace App\Http\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
-use Symfony\Component\HttpFoundation\Response;
 
-class AdminMiddleware
+class SuperAdminMiddleware
 {
-    public function handle(Request $request, Closure $next): Response
+    public function handle(Request $request, Closure $next)
     {
         $user = $request->user();
 
@@ -18,11 +17,9 @@ class AdminMiddleware
             ], 401);
         }
 
-        $role = strtolower($user->role);
-
-        if ($role !== 'admin' && $role !== 'super_admin') {
+        if (strtolower($user->role) !== 'super_admin') {
             return response()->json([
-                'message' => 'Akses hanya untuk admin.',
+                'message' => 'Akses ditolak. Fitur ini hanya untuk Super Admin.',
             ], 403);
         }
 

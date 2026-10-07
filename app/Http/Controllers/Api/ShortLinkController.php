@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Models\ShortLink;
 use App\Models\LinkHub;
+use App\Models\LockedAlias;
 use App\Services\AuditLogService;
 use App\Models\ShortLinkClick;
 use Illuminate\Support\Str;
@@ -19,6 +20,7 @@ class ShortLinkController extends Controller
     {
         $shortLinks = $request->user()
             ->shortLinks()
+            ->with('lockedUnitKerja') // <--- TAMBAHAN: load relasi kunci
             ->latest()
             ->get();
 
@@ -36,12 +38,18 @@ class ShortLinkController extends Controller
         $request->validate([
             'original_url' => 'required|url',
 
+            'type' => 'required|in:ASN,UMUM',
+
             'short_code' => [
                 'nullable',
                 'alpha_dash',
                 'unique:short_links,short_code',
-                
+
                 function ($attribute, $value, $fail) {
+                    if (!$value) return;
+
+                    $value = strtolower($value);
+
                     $reservedAliases = [
                         'admin',
                         'login',
@@ -50,34 +58,69 @@ class ShortLinkController extends Controller
                         'dashboard',
                         'user',
                         'settings',
-                        ];
+                    ];
 
-                        if (in_array(strtolower($value), $reservedAliases, true)) {
+                    if (in_array($value, $reservedAliases, true)) {
+                        $fail(
+                            'Alias tersebut tidak dapat digunakan karena merupakan alias sistem.'
+                        );
+                        return;
+                    }
+
+                    if (LinkHub::where('short_code', $value)->exists()) {
+                        $fail(
+                            'Alias tersebut sudah digunakan oleh Link Hub. Silakan pilih alias lain.'
+                        );
+                        return;
+                    }
+
+                    // Cek kunci alias
+                    $locked = LockedAlias::where('alias', $value)->first();
+                    if ($locked) {
+                        $userUnitKerjaId = auth()->user()->unit_kerja_id;
+                        $isAdmin = in_array(
+                            strtolower(auth()->user()->role),
+                            ['admin', 'super_admin']
+                        );
+
+                        if (!$isAdmin && $locked->unit_kerja_id != $userUnitKerjaId) {
+                            $namaOpd = $locked->unitKerja?->nama_unit_kerja
+                                ?? 'OPD lain';
+
                             $fail(
-                                'Alias tersebut tidak dapat digunakan karena merupakan alias sistem.'
-                                );
-                                }
-                                
-                                if (LinkHub::where('short_code', $value)->exists()) {
-                                $fail(
-                                    'Alias tersebut sudah digunakan oleh Link Hub. Silakan pilih alias lain.'
-                                    );
-        }
-    },
-],
+                                "Alias '{$value}' dikunci untuk {$namaOpd}. Silakan pakai alias lain."
+                            );
+                        }
+                    }
+                },
+            ],
 
             'title' => 'nullable|string|max:255',
+
+            // <--- TAMBAHAN: validasi kunci unit kerja
+            'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'short_code.unique' =>
                 'Alias tersebut sudah digunakan. Silakan pilih alias lain.',
+
+            'type.required' => 'Jenis link wajib dipilih.',
+            'type.in' => 'Jenis link harus ASN atau UMUM.',
+
+            'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
 
         $shortLink = ShortLink::create([
             'user_id' => auth()->id(),
             'original_url' => $request->original_url,
             'short_code' => $request->short_code ?? $this->generateUniqueShortCode(),
+            'type' => $request->type,
             'title' => $request->title,
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, 
+            'status' => true, 
         ]);
+
+        // Load relasi biar response include info unit kerja
+        $shortLink->load('lockedUnitKerja');
 
         AuditLogService::log(
             'shortlink.created',
@@ -87,8 +130,10 @@ class ShortLinkController extends Controller
             [
                 'short_code' => $shortLink->short_code,
                 'original_url' => $shortLink->original_url,
-                ]
-                );
+                'type' => $shortLink->type,
+                'locked_unit_kerja_id' => $shortLink->locked_unit_kerja_id,
+            ]
+        );
 
         return response()->json([
             'message' => 'URL berhasil dipendekkan',
@@ -101,32 +146,61 @@ class ShortLinkController extends Controller
      */
     public function redirect(Request $request, string $shortCode)
     {
-    $shortLink = ShortLink::where(
-        'short_code',
-        $shortCode
-    )->firstOrFail();
+        $shortLink = ShortLink::with('lockedUnitKerja')
+            ->where('short_code', $shortCode)
+            ->firstOrFail();
 
-    if (!$shortLink->status) {
-        return response()->json([
-            'message' => 'Short link ini sedang tidak aktif.'
-        ], 403);
-    }
+        if (!$shortLink->status) {
+            return response()->json([
+                'message' => 'Short link ini sedang tidak aktif.'
+            ], 403);
+        }
 
-    // Tentukan sumber akses
-    $source = $request->query('source') === 'qr'
-        ? 'qr'
-        : 'normal';
+        // <--- TAMBAHAN: Cek apakah link terkunci
+        if ($shortLink->locked_unit_kerja_id) {
+            $user = auth('sanctum')->user();
 
-    // Catat setiap klik
-    $shortLink->clicks()->create([
-        'clicked_at' => now(),
-        'source' => $source,
-    ]);
+            // Kalau tidak ada user (akses dari luar / tanpa login)
+            if (!$user) {
+                // Redirect ke halaman frontend dengan pesan terkunci
+                $frontendUrl = env('FRONTEND_URL', 'http://localhost:5173');
+                return redirect()->away(
+                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit=' 
+                    . urlencode($shortLink->lockedUnitKerja?->nama_unit_kerja ?? '')
+                );
+            }
 
-    // Tambahkan total klik
-    $shortLink->increment('click_count');
+            $isAdmin = in_array(
+                strtolower($user->role),
+                ['admin', 'super_admin']
+            );
+            $isMatch = (int) $user->unit_kerja_id === (int) $shortLink->locked_unit_kerja_id;
 
-    return redirect()->away($shortLink->original_url);
+            // Kalau user bukan admin dan unit kerjanya tidak cocok
+            if (!$isMatch && !$isAdmin) {
+                $frontendUrl = env('FRONTEND_URL', 'http://localhost:5173');
+                return redirect()->away(
+                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit=' 
+                    . urlencode($shortLink->lockedUnitKerja?->nama_unit_kerja ?? '')
+                );
+            }
+        }
+
+        // Tentukan sumber akses
+        $source = $request->query('source') === 'qr'
+            ? 'qr'
+            : 'normal';
+
+        // Catat setiap klik
+        $shortLink->clicks()->create([
+            'clicked_at' => now(),
+            'source' => $source,
+        ]);
+
+        // Tambahkan total klik
+        $shortLink->increment('click_count');
+
+        return redirect()->away($shortLink->original_url);
     }
 
     /**
@@ -134,133 +208,144 @@ class ShortLinkController extends Controller
      */
     public function todayClicks(Request $request)
     {
-    $query = ShortLinkClick::whereDate(
-        'clicked_at',
-        today()
-    );
+        $query = ShortLinkClick::whereDate(
+            'clicked_at',
+            today()
+        );
 
-    // Jika ADMIN, hitung semua klik
-    if ($request->user()->role !== 'ADMIN') {
-        // Jika USER, hanya hitung klik dari Short Link miliknya
-        $query->whereHas('shortLink', function ($query) use ($request) {
-            $query->where('user_id', $request->user()->id);
-        });
-    }
+        $isAdmin = in_array(
+            strtolower($request->user()->role),
+            ['admin', 'super_admin']
+        );
 
-    $todayClicks = $query->count();
+        if (!$isAdmin) {
+            $query->whereHas('shortLink', function ($query) use ($request) {
+                $query->where('user_id', $request->user()->id);
+            });
+        }
 
-    return response()->json([
-        'message' => 'Data klik hari ini berhasil diambil.',
-        'total_clicks_today' => $todayClicks,
-    ]);
+        $todayClicks = $query->count();
+
+        return response()->json([
+            'message' => 'Data klik hari ini berhasil diambil.',
+            'total_clicks_today' => $todayClicks,
+        ]);
     }
 
     public function monthClicks(Request $request)
     {
-    $query = ShortLinkClick::whereMonth(
-        'clicked_at',
-        now()->month
-    )
-    ->whereYear(
-        'clicked_at',
-        now()->year
-    );
+        $query = ShortLinkClick::whereMonth(
+            'clicked_at',
+            now()->month
+        )
+        ->whereYear(
+            'clicked_at',
+            now()->year
+        );
 
-    // Jika ADMIN, hitung semua klik
-    if ($request->user()->role !== 'ADMIN') {
-        // Jika USER, hanya hitung klik dari Short Link miliknya
-        $query->whereHas('shortLink', function ($query) use ($request) {
-            $query->where('user_id', $request->user()->id);
-        });
-    }
+        $isAdmin = in_array(
+            strtolower($request->user()->role),
+            ['admin', 'super_admin']
+        );
 
-    $monthClicks = $query->count();
+        if (!$isAdmin) {
+            $query->whereHas('shortLink', function ($query) use ($request) {
+                $query->where('user_id', $request->user()->id);
+            });
+        }
 
-    return response()->json([
-        'message' => 'Data klik bulan ini berhasil diambil.',
-        'total_clicks_this_month' => $monthClicks,
-    ]);
+        $monthClicks = $query->count();
+
+        return response()->json([
+            'message' => 'Data klik bulan ini berhasil diambil.',
+            'total_clicks_this_month' => $monthClicks,
+        ]);
     }
 
     public function qrScans(Request $request)
     {
-    $query = ShortLinkClick::where('source', 'qr');
+        $query = ShortLinkClick::where('source', 'qr');
 
-    // Jika bukan ADMIN, hanya hitung QR scan milik user tersebut
-    if ($request->user()->role !== 'ADMIN') {
-        $query->whereHas('shortLink', function ($query) use ($request) {
-            $query->where('user_id', $request->user()->id);
-        });
+        $isAdmin = in_array(
+            strtolower($request->user()->role),
+            ['admin', 'super_admin']
+        );
+
+        if (!$isAdmin) {
+            $query->whereHas('shortLink', function ($query) use ($request) {
+                $query->where('user_id', $request->user()->id);
+            });
+        }
+
+        $totalQrScans = $query->count();
+
+        return response()->json([
+            'message' => 'Total QR Scan berhasil diambil.',
+            'total_qr_scans' => $totalQrScans,
+        ]);
     }
-
-    $totalQrScans = $query->count();
-
-    return response()->json([
-        'message' => 'Total QR Scan berhasil diambil.',
-        'total_qr_scans' => $totalQrScans,
-    ]);
-    }
-
-
 
     public function stats(Request $request)
     {
-    $days = (int) $request->query('days', 7);
+        $days = (int) $request->query('days', 7);
 
-    // Batasi pilihan periode agar aman
-    if (!in_array($days, [7, 30])) {
-        $days = 7;
-    }
+        if (!in_array($days, [7, 30])) {
+            $days = 7;
+        }
 
-    $startDate = now()
-        ->subDays($days - 1)
-        ->startOfDay();
+        $startDate = now()
+            ->subDays($days - 1)
+            ->startOfDay();
 
-    $query = ShortLinkClick::where(
-        'clicked_at',
-        '>=',
-        $startDate
-    );
+        $query = ShortLinkClick::where(
+            'clicked_at',
+            '>=',
+            $startDate
+        );
 
-    // Jika bukan ADMIN, hanya hitung klik milik user tersebut
-    if ($request->user()->role !== 'ADMIN') {
-        $query->whereHas('shortLink', function ($query) use ($request) {
-            $query->where(
-                'user_id',
-                $request->user()->id
-            );
-        });
-    }
+        $isAdmin = in_array(
+            strtolower($request->user()->role),
+            ['admin', 'super_admin']
+        );
 
-    $clicks = $query
-        ->selectRaw(
-            'DATE(clicked_at) as date, COUNT(*) as total_clicks'
-        )
-        ->groupBy('date')
-        ->orderBy('date')
-        ->get()
-        ->keyBy('date');
+        if (!$isAdmin) {
+            $query->whereHas('shortLink', function ($query) use ($request) {
+                $query->where(
+                    'user_id',
+                    $request->user()->id
+                );
+            });
+        }
 
-    $stats = [];
+        $clicks = $query
+            ->selectRaw(
+                'DATE(clicked_at) as date, COUNT(*) as total_clicks'
+            )
+            ->groupBy('date')
+            ->orderBy('date')
+            ->get()
+            ->keyBy('date');
 
-    for ($i = 0; $i < $days; $i++) {
-        $date = now()
-            ->subDays($days - 1 - $i)
-            ->format('Y-m-d');
+        $stats = [];
 
-        $stats[] = [
-            'date' => $date,
-            'total_clicks' => isset($clicks[$date])
-                ? (int) $clicks[$date]->total_clicks
-                : 0,
-        ];
-    }
+        for ($i = 0; $i < $days; $i++) {
+            $date = now()
+                ->subDays($days - 1 - $i)
+                ->format('Y-m-d');
 
-    return response()->json([
-        'message' => 'Statistik klik berhasil diambil.',
-        'period_days' => $days,
-        'data' => $stats,
-    ]);
+            $stats[] = [
+                'date' => $date,
+                'total_clicks' => isset($clicks[$date])
+                    ? (int) $clicks[$date]->total_clicks
+                    : 0,
+            ];
+        }
+
+        return response()->json([
+            'message' => 'Statistik klik berhasil diambil.',
+            'period_days' => $days,
+            'data' => $stats,
+        ]);
     }
 
     /**
@@ -307,34 +392,44 @@ class ShortLinkController extends Controller
                     if (LinkHub::where('short_code', $value)->exists()) {
                         $fail(
                             'Alias tersebut sudah digunakan oleh Link Hub. Silakan pilih alias lain.'
-                            );
-                            }
+                        );
+                    }
                 },
             ],
 
             'title' => 'nullable|string|max:255',
+
+            // <--- TAMBAHAN: validasi kunci unit kerja
+            'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'short_code.unique' =>
                 'Alias tersebut sudah digunakan. Silakan pilih alias lain.',
+
+            'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
 
         $shortLink->update([
             'original_url' => $request->original_url,
             'short_code' => $request->short_code,
             'title' => $request->title,
-            ]);
-            
-            AuditLogService::log(
-                'shortlink.updated',
-                'ShortLink',
-                $shortLink->id,
-                'Short Link berhasil diperbarui',
-                [
-                    'short_code' => $shortLink->short_code,
-                    'original_url' => $shortLink->original_url,
-                    'title' => $shortLink->title,
-                    ]
-                    );
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, // <--- TAMBAHAN
+        ]);
+
+        // Load relasi biar response include info unit kerja
+        $shortLink->load('lockedUnitKerja');
+
+        AuditLogService::log(
+            'shortlink.updated',
+            'ShortLink',
+            $shortLink->id,
+            'Short Link berhasil diperbarui',
+            [
+                'short_code' => $shortLink->short_code,
+                'original_url' => $shortLink->original_url,
+                'title' => $shortLink->title,
+                'locked_unit_kerja_id' => $shortLink->locked_unit_kerja_id,
+            ]
+        );
 
         return response()->json([
             'message' => 'Short link berhasil diperbarui.',
@@ -354,6 +449,8 @@ class ShortLinkController extends Controller
         $shortLink->update([
             'status' => !$shortLink->status,
         ]);
+
+        $shortLink->load('lockedUnitKerja');
 
         return response()->json([
             'message' => $shortLink->status
@@ -377,19 +474,17 @@ class ShortLinkController extends Controller
         return response()->json([
             'message' => 'Short link berhasil dihapus.',
         ]);
-
     }
-
 
     private function generateUniqueShortCode()
     {
-    do {
-        $code = Str::random(3);
-    } while (
-        ShortLink::where('short_code', $code)->exists()
-        || LinkHub::where('short_code', $code)->exists()
-    );
+        do {
+            $code = Str::random(3);
+        } while (
+            ShortLink::where('short_code', $code)->exists()
+            || LinkHub::where('short_code', $code)->exists()
+        );
 
-    return $code;
+        return $code;
     }
 }

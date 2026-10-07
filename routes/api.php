@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\AdminUserController;
 use App\Http\Controllers\Api\StatisticsApiController;
 use App\Http\Controllers\LinkHubController;
 use App\Http\Controllers\Api\FeedbackController;
+use App\Http\Controllers\Api\LockedAliasController;
 
 
 
@@ -50,7 +51,10 @@ Route::middleware('auth:sanctum')->put('/user/unit-kerja', function (Request $re
     ]);
 });
 
-
+Route::middleware('auth:sanctum')->get(
+    '/user/locked-aliases',
+    [LockedAliasController::class, 'myAliases']
+);
 Route::get('/integration/statistics', [StatisticsApiController::class, 'index'])
     ->middleware('statistics.api.key');
 
@@ -97,6 +101,12 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::put('/short-links/{id}', [AdminUserController::class, 'updateShortLink']);
         Route::patch('/short-links/{id}/status', [AdminUserController::class, 'toggleShortLink']);
         Route::delete('/short-links/{id}', [AdminUserController::class, 'deleteShortLink']);
+
+            Route::middleware('super_admin')->prefix('super')->group(function () {
+            Route::get('/locked-aliases', [LockedAliasController::class, 'index']);
+            Route::post('/locked-aliases', [LockedAliasController::class, 'store']);
+            Route::delete('/locked-aliases/{id}', [LockedAliasController::class, 'destroy']);
+        });
     });
 
 });

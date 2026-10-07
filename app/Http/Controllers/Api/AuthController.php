@@ -13,12 +13,22 @@ class AuthController extends Controller
     public function register(Request $request)
     {
         $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users,email',
-            'password' => 'required|string|min:8|confirmed',
-            'unit_kerja_id' => 'required|exists:unit_kerjas,id',
-            'user_type' => 'required|in:ASN,UMUM',
-        ]);
+    'name' => 'required|string|max:255',
+    'email' => 'required|email|unique:users,email',
+    'password' => 'required|min:8|confirmed',
+    'user_type' => 'required|in:ASN,UMUM',
+    'unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
+]);
+
+// Validasi kondisional: ASN wajib punya unit kerja
+if ($request->user_type === 'ASN' && !$request->unit_kerja_id) {
+    return response()->json([
+        'message' => 'Unit kerja wajib diisi untuk ASN.',
+        'errors' => [
+            'unit_kerja_id' => ['Unit kerja wajib diisi untuk ASN.'],
+        ],
+    ], 422);
+}
 
         $user = User::create([
             'name' => $request->name,
@@ -63,7 +73,7 @@ class AuthController extends Controller
 
     public function googleCallback()
     {
-    $googleUser = Socialite::driver('google')->user();
+    $googleUser = Socialite::driver('google')->stateless()->user(); 
 
     $user = User::where('email', $googleUser->email)->first();
 
