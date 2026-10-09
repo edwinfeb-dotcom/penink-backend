@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\AuditLogService;
+use App\Services\ContentModerationService;
 use App\Models\LinkHub;
 use App\Models\ShortLink;
 use App\Models\LockedAlias;
@@ -17,8 +18,16 @@ class LinkHubController extends Controller
     {
         return in_array(
             strtolower($user->role),
-            ['admin', 'super_admin']
+            ['admin', 'super_admin', 'admin_unit']
         );
+    }
+
+    /**
+     * Helper: cek apakah user adalah admin_unit
+     */
+    private function isAdminUnit($user)
+    {
+        return strtolower($user->role) === 'admin_unit';
     }
 
     public function index(Request $request)
@@ -26,11 +35,19 @@ class LinkHubController extends Controller
         $user = $request->user();
 
         if ($this->isAdmin($user)) {
-            $linkHubs = LinkHub::with(['items', 'lockedUnitKerja']) // <--- TAMBAHAN
-                ->latest()
-                ->get();
+            $query = LinkHub::with(['items', 'lockedUnitKerja', 'user.unitKerja']);
+
+            // admin_unit → scope ke OPD-nya
+            if ($this->isAdminUnit($user)) {
+                $query->whereHas('user', function ($q) use ($user) {
+                    $q->where('unit_kerja_id', $user->unit_kerja_id);
+                });
+            }
+            // admin & super_admin → lihat semua
+
+            $linkHubs = $query->latest()->get();
         } else {
-            $linkHubs = LinkHub::with(['items', 'lockedUnitKerja']) // <--- TAMBAHAN
+            $linkHubs = LinkHub::with(['items', 'lockedUnitKerja'])
                 ->where('user_id', $user->id)
                 ->latest()
                 ->get();
@@ -44,6 +61,15 @@ class LinkHubController extends Controller
 
     public function store(Request $request)
     {
+        // =====================================================
+        // PAKSA SHORT_CODE JADI LOWERCASE
+        // =====================================================
+        if ($request->filled('short_code')) {
+            $request->merge([
+                'short_code' => strtolower($request->short_code),
+            ]);
+        }
+
         $request->validate([
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
@@ -87,7 +113,7 @@ class LinkHubController extends Controller
                         $userUnitKerjaId = auth()->user()->unit_kerja_id;
                         $isAdmin = in_array(
                             strtolower(auth()->user()->role),
-                            ['admin', 'super_admin']
+                            ['admin', 'super_admin', 'admin_unit']
                         );
 
                         if (!$isAdmin && $locked->unit_kerja_id != $userUnitKerjaId) {
@@ -102,7 +128,6 @@ class LinkHubController extends Controller
                 },
             ],
 
-            // <--- TAMBAHAN: validasi kunci unit kerja
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'title.required' => 'Judul Link Hub wajib diisi.',
@@ -122,7 +147,7 @@ class LinkHubController extends Controller
             'short_code' => $request->short_code,
             'type' => $request->type,
             'status' => true,
-            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, // <--- TAMBAHAN
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
         ]);
 
         $linkHub->load('lockedUnitKerja');
@@ -146,17 +171,40 @@ class LinkHubController extends Controller
         ], 201);
     }
 
-    public function addItem(Request $request, $id)
+    /**
+     * Helper: ambil LinkHub dengan guard admin_unit
+     */
+    private function findLinkHub(Request $request, $id)
     {
         $user = $request->user();
 
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $id)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $id)
-                ->where('user_id', $user->id)
+        if ($this->isAdminUnit($user)) {
+            $linkHub = LinkHub::with('user')
+                ->where('id', $id)
                 ->firstOrFail();
+
+            if ($linkHub->user?->unit_kerja_id !== $user->unit_kerja_id) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Anda hanya bisa mengelola Link Hub dari unit kerja Anda.',
+                ], 403));
+            }
+
+            return $linkHub;
         }
+
+        if ($this->isAdmin($user)) {
+            return LinkHub::where('id', $id)->firstOrFail();
+        }
+
+        return LinkHub::where('id', $id)
+            ->where('user_id', $user->id)
+            ->firstOrFail();
+    }
+
+    public function addItem(Request $request, $id)
+    {
+        $linkHub = $this->findLinkHub($request, $id);
 
         $request->validate([
             'title' => 'required|string|max:255',
@@ -166,6 +214,20 @@ class LinkHubController extends Controller
             'url.required' => 'URL link wajib diisi.',
             'url.url' => 'URL yang dimasukkan tidak valid.',
         ]);
+
+        // =====================================================
+        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
+        // =====================================================
+        $moderation = ContentModerationService::check($request->url);
+
+        if ($moderation['blocked']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'URL yang Anda masukkan terdeteksi sebagai konten yang tidak diizinkan. '
+                    . 'PENINK melarang penambahan link ke situs judi online / pinjaman ilegal.',
+                'error_code' => 'blocked_content',
+            ], 422);
+        }
 
         $item = $linkHub->items()->create([
             'title' => $request->title,
@@ -196,15 +258,7 @@ class LinkHubController extends Controller
 
     public function updateItem(Request $request, $hubId, $itemId)
     {
-        $user = $request->user();
-
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $hubId)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $hubId)
-                ->where('user_id', $user->id)
-                ->firstOrFail();
-        }
+        $linkHub = $this->findLinkHub($request, $hubId);
 
         $item = $linkHub->items()
             ->where('id', $itemId)
@@ -219,6 +273,20 @@ class LinkHubController extends Controller
             'url.required' => 'URL link wajib diisi.',
             'url.url' => 'URL yang dimasukkan tidak valid.',
         ]);
+
+        // =====================================================
+        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
+        // =====================================================
+        $moderation = ContentModerationService::check($request->url);
+
+        if ($moderation['blocked']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'URL yang Anda masukkan terdeteksi sebagai konten yang tidak diizinkan. '
+                    . 'PENINK melarang penambahan link ke situs judi online / pinjaman ilegal.',
+                'error_code' => 'blocked_content',
+            ], 422);
+        }
 
         $item->update([
             'title' => $request->title,
@@ -250,15 +318,7 @@ class LinkHubController extends Controller
 
     public function deleteItem(Request $request, $hubId, $itemId)
     {
-        $user = $request->user();
-
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $hubId)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $hubId)
-                ->where('user_id', $user->id)
-                ->firstOrFail();
-        }
+        $linkHub = $this->findLinkHub($request, $hubId);
 
         $item = $linkHub->items()->where('id', $itemId)->firstOrFail();
 
@@ -288,15 +348,7 @@ class LinkHubController extends Controller
 
     public function toggleItemStatus(Request $request, $hubId, $itemId)
     {
-        $user = $request->user();
-
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $hubId)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $hubId)
-                ->where('user_id', $user->id)
-                ->firstOrFail();
-        }
+        $linkHub = $this->findLinkHub($request, $hubId);
 
         $item = $linkHub->items()
             ->where('id', $itemId)
@@ -331,15 +383,16 @@ class LinkHubController extends Controller
 
     public function update(Request $request, $id)
     {
-        $user = $request->user();
-
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $id)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $id)
-                ->where('user_id', $user->id)
-                ->firstOrFail();
+        // =====================================================
+        // PAKSA SHORT_CODE JADI LOWERCASE
+        // =====================================================
+        if ($request->filled('short_code')) {
+            $request->merge([
+                'short_code' => strtolower($request->short_code),
+            ]);
         }
+
+        $linkHub = $this->findLinkHub($request, $id);
 
         $request->validate([
             'title' => 'required|string|max:255',
@@ -385,7 +438,7 @@ class LinkHubController extends Controller
                         $userUnitKerjaId = auth()->user()->unit_kerja_id;
                         $isAdmin = in_array(
                             strtolower(auth()->user()->role),
-                            ['admin', 'super_admin']
+                            ['admin', 'super_admin', 'admin_unit']
                         );
 
                         if (!$isAdmin && $locked->unit_kerja_id != $userUnitKerjaId) {
@@ -400,7 +453,6 @@ class LinkHubController extends Controller
                 },
             ],
 
-            // <--- TAMBAHAN: validasi kunci unit kerja
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'title.required' => 'Judul Link Hub wajib diisi.',
@@ -418,7 +470,7 @@ class LinkHubController extends Controller
             'description' => $request->description,
             'short_code' => $request->short_code,
             'type' => $request->type,
-            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, // <--- TAMBAHAN
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
         ]);
 
         $linkHub->load('lockedUnitKerja');
@@ -444,15 +496,7 @@ class LinkHubController extends Controller
 
     public function toggleStatus(Request $request, $id)
     {
-        $user = $request->user();
-
-        if ($this->isAdmin($user)) {
-            $linkHub = LinkHub::where('id', $id)->firstOrFail();
-        } else {
-            $linkHub = LinkHub::where('id', $id)
-                ->where('user_id', $user->id)
-                ->firstOrFail();
-        }
+        $linkHub = $this->findLinkHub($request, $id);
 
         $linkHub->status = !$linkHub->status;
         $linkHub->save();
@@ -481,9 +525,7 @@ class LinkHubController extends Controller
 
     public function destroy(Request $request, $id)
     {
-        $linkHub = LinkHub::where('id', $id)
-            ->where('user_id', $request->user()->id)
-            ->firstOrFail();
+        $linkHub = $this->findLinkHub($request, $id);
 
         $auditData = [
             'title' => $linkHub->title,
@@ -517,15 +559,15 @@ class LinkHubController extends Controller
                 $query->where('status', true)
                     ->orderBy('sort_order');
             },
-            'lockedUnitKerja', // <--- TAMBAHAN
+            'lockedUnitKerja',
         ])
             ->where('short_code', $shortCode)
             ->where('status', true)
             ->firstOrFail();
 
-        // <--- TAMBAHAN: Cek apakah link hub terkunci
+        // Cek apakah link hub terkunci
         if ($linkHub->locked_unit_kerja_id) {
-            $user = auth('sanctum')->user(); 
+            $user = auth('sanctum')->user();
 
             // Kalau tidak ada user (akses publik tanpa login)
             if (!$user) {
@@ -536,9 +578,10 @@ class LinkHubController extends Controller
                 ], 401);
             }
 
+            // Admin, super_admin, admin_unit → bypass
             $isAdmin = in_array(
                 strtolower($user->role),
-                ['admin', 'super_admin']
+                ['admin', 'super_admin', 'admin_unit']
             );
             $isMatch = (int) $user->unit_kerja_id === (int) $linkHub->locked_unit_kerja_id;
 

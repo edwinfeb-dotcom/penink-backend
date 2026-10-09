@@ -14,15 +14,18 @@ class AdminMiddleware
 
         if (!$user) {
             return response()->json([
+                'success' => false,
                 'message' => 'Unauthenticated.',
             ], 401);
         }
 
         $role = strtolower($user->role);
 
-        if ($role !== 'admin' && $role !== 'super_admin') {
+        // Izinkan: admin, super_admin, admin_unit
+        if (!in_array($role, ['admin', 'super_admin', 'admin_unit'])) {
             return response()->json([
-                'message' => 'Akses hanya untuk admin.',
+                'success' => false,
+                'message' => 'Akses ditolak. Hanya admin yang dapat mengakses.',
             ], 403);
         }
 

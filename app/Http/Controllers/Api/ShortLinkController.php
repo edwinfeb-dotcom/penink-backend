@@ -10,6 +10,7 @@ use App\Models\ShortLinkClick;
 use Illuminate\Support\Str;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
+use App\Services\ContentModerationService;
 
 class ShortLinkController extends Controller
 {
@@ -20,7 +21,7 @@ class ShortLinkController extends Controller
     {
         $shortLinks = $request->user()
             ->shortLinks()
-            ->with('lockedUnitKerja') // <--- TAMBAHAN: load relasi kunci
+            ->with('lockedUnitKerja')
             ->latest()
             ->get();
 
@@ -35,6 +36,16 @@ class ShortLinkController extends Controller
      */
     public function store(Request $request)
     {
+        // =====================================================
+    // PAKSA SHORT_CODE JADI LOWERCASE
+    // =====================================================
+    if ($request->filled('short_code')) {
+        $request->merge([
+            'short_code' => strtolower($request->short_code),
+        ]);
+    }
+
+
         $request->validate([
             'original_url' => 'required|url',
 
@@ -74,7 +85,6 @@ class ShortLinkController extends Controller
                         return;
                     }
 
-                    // Cek kunci alias
                     $locked = LockedAlias::where('alias', $value)->first();
                     if ($locked) {
                         $userUnitKerjaId = auth()->user()->unit_kerja_id;
@@ -97,7 +107,6 @@ class ShortLinkController extends Controller
 
             'title' => 'nullable|string|max:255',
 
-            // <--- TAMBAHAN: validasi kunci unit kerja
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'short_code.unique' =>
@@ -109,17 +118,44 @@ class ShortLinkController extends Controller
             'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
 
+        // =====================================================
+        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
+        // =====================================================
+        $moderation = ContentModerationService::check($request->original_url);
+
+        if ($moderation['blocked']) {
+            AuditLogService::log(
+                'shortlink.blocked',
+                'ShortLink',
+                0,
+                'Link terdeteksi terlarang diblokir',
+                [
+                    'original_url' => $request->original_url,
+                    'reason' => $moderation['reason'],
+                    'user_id' => auth()->id(),
+                ]
+            );
+
+            return response()->json([
+                'success' => false,
+                'message' => $moderation['message'],
+                'error_code' => 'blocked_content',
+            ], 422);
+        }
+
+        // =====================================================
+        // SIMPAN SHORT LINK
+        // =====================================================
         $shortLink = ShortLink::create([
             'user_id' => auth()->id(),
             'original_url' => $request->original_url,
             'short_code' => $request->short_code ?? $this->generateUniqueShortCode(),
             'type' => $request->type,
             'title' => $request->title,
-            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, 
-            'status' => true, 
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
+            'status' => true,
         ]);
 
-        // Load relasi biar response include info unit kerja
         $shortLink->load('lockedUnitKerja');
 
         AuditLogService::log(
@@ -156,16 +192,13 @@ class ShortLinkController extends Controller
             ], 403);
         }
 
-        // <--- TAMBAHAN: Cek apakah link terkunci
         if ($shortLink->locked_unit_kerja_id) {
             $user = auth('sanctum')->user();
 
-            // Kalau tidak ada user (akses dari luar / tanpa login)
             if (!$user) {
-                // Redirect ke halaman frontend dengan pesan terkunci
                 $frontendUrl = env('FRONTEND_URL', 'http://localhost:5173');
                 return redirect()->away(
-                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit=' 
+                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit='
                     . urlencode($shortLink->lockedUnitKerja?->nama_unit_kerja ?? '')
                 );
             }
@@ -176,28 +209,24 @@ class ShortLinkController extends Controller
             );
             $isMatch = (int) $user->unit_kerja_id === (int) $shortLink->locked_unit_kerja_id;
 
-            // Kalau user bukan admin dan unit kerjanya tidak cocok
             if (!$isMatch && !$isAdmin) {
                 $frontendUrl = env('FRONTEND_URL', 'http://localhost:5173');
                 return redirect()->away(
-                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit=' 
+                    $frontendUrl . '/?locked_link=' . $shortCode . '&unit='
                     . urlencode($shortLink->lockedUnitKerja?->nama_unit_kerja ?? '')
                 );
             }
         }
 
-        // Tentukan sumber akses
         $source = $request->query('source') === 'qr'
             ? 'qr'
             : 'normal';
 
-        // Catat setiap klik
         $shortLink->clicks()->create([
             'clicked_at' => now(),
             'source' => $source,
         ]);
 
-        // Tambahkan total klik
         $shortLink->increment('click_count');
 
         return redirect()->away($shortLink->original_url);
@@ -361,6 +390,16 @@ class ShortLinkController extends Controller
      */
     public function update(Request $request, string $id)
     {
+         // =====================================================
+    // PAKSA SHORT_CODE JADI LOWERCASE
+    // =====================================================
+    if ($request->filled('short_code')) {
+        $request->merge([
+            'short_code' => strtolower($request->short_code),
+        ]);
+    }
+
+
         $shortLink = ShortLink::where('id', $id)
             ->where('user_id', auth()->id())
             ->firstOrFail();
@@ -399,7 +438,6 @@ class ShortLinkController extends Controller
 
             'title' => 'nullable|string|max:255',
 
-            // <--- TAMBAHAN: validasi kunci unit kerja
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'short_code.unique' =>
@@ -408,14 +446,29 @@ class ShortLinkController extends Controller
             'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
 
+        // =====================================================
+        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
+        // =====================================================
+        $moderation = ContentModerationService::check($request->original_url);
+
+        if ($moderation['blocked']) {
+            return response()->json([
+                'success' => false,
+                'message' => $moderation['message'],
+                'error_code' => 'blocked_content',
+            ], 422);
+        }
+
+        // =====================================================
+        // UPDATE SHORT LINK
+        // =====================================================
         $shortLink->update([
             'original_url' => $request->original_url,
             'short_code' => $request->short_code,
             'title' => $request->title,
-            'locked_unit_kerja_id' => $request->locked_unit_kerja_id, // <--- TAMBAHAN
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
         ]);
 
-        // Load relasi biar response include info unit kerja
         $shortLink->load('lockedUnitKerja');
 
         AuditLogService::log(
@@ -486,5 +539,48 @@ class ShortLinkController extends Controller
         );
 
         return $code;
+    }
+
+    /**
+     * Resolve short link terkunci untuk user yang login.
+     */
+    public function resolve(Request $request, string $code)
+    {
+        $shortLink = ShortLink::with('lockedUnitKerja')
+            ->where('short_code', $code)
+            ->firstOrFail();
+
+        if (!$shortLink->status) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Short link ini sedang tidak aktif.',
+            ], 403);
+        }
+
+        if ($shortLink->locked_unit_kerja_id) {
+            $user = $request->user();
+            $isAdmin = in_array(strtolower($user->role), ['admin', 'super_admin']);
+            $isMatch = (int) $user->unit_kerja_id === (int) $shortLink->locked_unit_kerja_id;
+
+            if (!$isMatch && !$isAdmin) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Link terkunci untuk unit kerja: '
+                        . ($shortLink->lockedUnitKerja?->nama_unit_kerja ?? 'Tertentu'),
+                    'error_code' => 'forbidden',
+                ], 403);
+            }
+        }
+
+        $shortLink->clicks()->create([
+            'clicked_at' => now(),
+            'source' => 'normal',
+        ]);
+        $shortLink->increment('click_count');
+
+        return response()->json([
+            'success' => true,
+            'original_url' => $shortLink->original_url,
+        ]);
     }
 }

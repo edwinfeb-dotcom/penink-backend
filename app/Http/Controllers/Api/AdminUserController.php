@@ -15,14 +15,42 @@ use Illuminate\Validation\Rule;
 
 class AdminUserController extends Controller
 {
+    // =====================================================
+    // HELPER ROLE
+    // =====================================================
+    private function isSuperAdmin($user)
+    {
+        return strtolower($user->role) === 'super_admin';
+    }
+
+    private function isAdminUnit($user)
+    {
+        return strtolower($user->role) === 'admin_unit';
+    }
+
+    private function isGlobalAdmin($user)
+    {
+        return in_array(strtolower($user->role), ['admin', 'super_admin']);
+    }
+
+
     // =========================
     // DAFTAR USER
     // =========================
-    public function index()
+    public function index(Request $request)
     {
-        $users = User::with('unitKerja')
-            ->latest()
-            ->get();
+        $user = $request->user();
+
+        $query = User::with('unitKerja');
+
+        // admin_unit → hanya user dari OPD-nya
+        if ($this->isAdminUnit($user)) {
+            $query->where('unit_kerja_id', $user->unit_kerja_id);
+        }
+
+        // admin & super_admin → lihat semua user
+
+        $users = $query->latest()->get();
 
         return response()->json([
             'message' => 'Data user berhasil diambil.',
@@ -50,6 +78,8 @@ class AdminUserController extends Controller
     // =========================
     public function store(Request $request)
     {
+        $user = $request->user();
+
         $validated = $request->validate([
             'name' => [
                 'required',
@@ -78,7 +108,7 @@ class AdminUserController extends Controller
                 ]),
             ],
 
-            'role' => 'required|in:user,admin,super_admin',
+            'role' => 'required|in:user,admin,admin_unit,super_admin',
 
             'unit_kerja_id' => [
                 'nullable',
@@ -86,23 +116,36 @@ class AdminUserController extends Controller
             ],
         ]);
 
-        // Guard: cuma super_admin yang bisa buat super_admin
+        // Guard 1: cuma super_admin yang bisa buat super_admin
         if (
             $request->role === 'super_admin' &&
-            strtolower($request->user()->role) !== 'super_admin'
+            !$this->isSuperAdmin($user)
         ) {
             return response()->json([
                 'message' => 'Hanya Super Admin yang bisa membuat Super Admin.',
             ], 403);
         }
 
-        $user = User::create($validated);
+        // Guard 2: admin_unit hanya bisa buat user di OPD-nya sendiri
+        if ($this->isAdminUnit($user)) {
+            // Paksa unit_kerja_id jadi OPD-nya
+            $validated['unit_kerja_id'] = $user->unit_kerja_id;
 
-        $user->load('unitKerja');
+            // admin_unit tidak bisa buat admin atau super_admin
+            if (in_array($request->role, ['admin', 'super_admin'])) {
+                return response()->json([
+                    'message' => 'Admin Unit hanya bisa membuat user biasa atau admin unit.',
+                ], 403);
+            }
+        }
+
+        $newUser = User::create($validated);
+
+        $newUser->load('unitKerja');
 
         return response()->json([
             'message' => 'User berhasil ditambahkan.',
-            'data' => $user,
+            'data' => $newUser,
         ], 201);
     }
 
@@ -112,6 +155,17 @@ class AdminUserController extends Controller
     // =========================
     public function update(Request $request, User $user)
     {
+        $requester = $request->user();
+
+        // Guard 1: admin_unit hanya bisa edit user dari OPD-nya
+        if ($this->isAdminUnit($requester)) {
+            if ($user->unit_kerja_id !== $requester->unit_kerja_id) {
+                return response()->json([
+                    'message' => 'Anda hanya bisa mengelola user dari unit kerja Anda.',
+                ], 403);
+            }
+        }
+
         $validated = $request->validate([
             'name' => [
                 'required',
@@ -145,6 +199,7 @@ class AdminUserController extends Controller
                 Rule::in([
                     'user',
                     'admin',
+                    'admin_unit',
                     'super_admin',
                 ]),
             ],
@@ -155,24 +210,37 @@ class AdminUserController extends Controller
             ],
         ]);
 
-        // Guard 1: cuma super_admin yang bisa ubah role jadi super_admin
+        // Guard 2: cuma super_admin yang bisa ubah role jadi super_admin
         if (
             $request->role === 'super_admin' &&
-            strtolower($request->user()->role) !== 'super_admin'
+            !$this->isSuperAdmin($requester)
         ) {
             return response()->json([
                 'message' => 'Hanya Super Admin yang bisa mengubah role menjadi Super Admin.',
             ], 403);
         }
 
-        // Guard 2: cuma super_admin yang bisa ubah akun super_admin
+        // Guard 3: cuma super_admin yang bisa ubah akun super_admin
         if (
             strtolower($user->role) === 'super_admin' &&
-            strtolower($request->user()->role) !== 'super_admin'
+            !$this->isSuperAdmin($requester)
         ) {
             return response()->json([
                 'message' => 'Hanya Super Admin yang bisa mengubah akun Super Admin.',
             ], 403);
+        }
+
+        // Guard 4: admin_unit tidak bisa ubah role user atau pindah OPD
+        if ($this->isAdminUnit($requester)) {
+            // Paksa unit kerja tetap di OPD-nya
+            $validated['unit_kerja_id'] = $requester->unit_kerja_id;
+
+            // Tidak boleh naikkan role user ke admin/super_admin
+            if (in_array($request->role, ['admin', 'super_admin'])) {
+                return response()->json([
+                    'message' => 'Admin Unit hanya bisa mengatur role user atau admin unit.',
+                ], 403);
+            }
         }
 
         if (empty($validated['password'])) {
@@ -193,46 +261,71 @@ class AdminUserController extends Controller
     // =========================
     // STATISTIK ADMIN
     // =========================
-    public function statistics()
+    public function statistics(Request $request)
     {
-        $totalUsers = User::count();
+        $user = $request->user();
 
-        $totalShortLinks = ShortLink::count();
+        $userQuery = User::query();
+        $shortLinkQuery = ShortLink::query();
+        $shortLinkClickQuery = ShortLinkClick::query();
+        $linkHubQuery = LinkHub::query();
 
-        $totalLinkHubs = LinkHub::count();
+        // admin_unit → scope ke OPD-nya
+        if ($this->isAdminUnit($user)) {
+            $userQuery->where('unit_kerja_id', $user->unit_kerja_id);
 
-        $activeShortLinks = ShortLink::where('status', true)->count();
+            $shortLinkQuery->whereHas('user', function ($q) use ($user) {
+                $q->where('unit_kerja_id', $user->unit_kerja_id);
+            });
 
-        $totalClicks = (int) ShortLink::sum('click_count');
+            $shortLinkClickQuery->whereHas('shortLink.user', function ($q) use ($user) {
+                $q->where('unit_kerja_id', $user->unit_kerja_id);
+            });
 
-        $totalUsersASN = User::where('user_type', 'ASN')->count();
+            $linkHubQuery->whereHas('user', function ($q) use ($user) {
+                $q->where('unit_kerja_id', $user->unit_kerja_id);
+            });
+        }
 
-        $totalUsersUmum = User::where('user_type', 'UMUM')->count();
+        $totalUsers = $userQuery->count();
 
-        $todayClicks = ShortLinkClick::whereDate(
-            'clicked_at',
-            Carbon::today()
-        )->count();
+        $totalShortLinks = $shortLinkQuery->count();
 
-        $monthClicks = ShortLinkClick::whereMonth(
-            'clicked_at',
-            Carbon::now()->month
-        )
-            ->whereYear(
-                'clicked_at',
-                Carbon::now()->year
-            )
+        $totalLinkHubs = $linkHubQuery->count();
+
+        $activeShortLinks = (clone $shortLinkQuery)->where('status', true)->count();
+
+        $totalClicks = (int) $shortLinkQuery->sum('click_count');
+
+        $totalUsersASN = (clone $userQuery)->where('user_type', 'ASN')->count();
+
+        $totalUsersUmum = (clone $userQuery)->where('user_type', 'UMUM')->count();
+
+        $todayClicks = $shortLinkClickQuery
+            ->whereDate('clicked_at', Carbon::today())
+            ->count();
+
+        $monthClicks = (clone $shortLinkClickQuery)
+            ->whereMonth('clicked_at', Carbon::now()->month)
+            ->whereYear('clicked_at', Carbon::now()->year)
             ->count();
 
 
         // =========================
         // SHORT LINK BERDASARKAN UNIT KERJA
         // =========================
-        $shortLinksByUnit = ShortLink::with('user.unitKerja')
+        $shortLinksByUnitQuery = ShortLink::with('user.unitKerja');
+
+        if ($this->isAdminUnit($user)) {
+            $shortLinksByUnitQuery->whereHas('user', function ($q) use ($user) {
+                $q->where('unit_kerja_id', $user->unit_kerja_id);
+            });
+        }
+
+        $shortLinksByUnit = $shortLinksByUnitQuery
             ->get()
             ->groupBy(function ($shortLink) {
-                return $shortLink->user?->unitKerja?->id
-                    ?? 0;
+                return $shortLink->user?->unitKerja?->id ?? 0;
             })
             ->map(function ($links, $unitId) {
                 $unit = $links->first()->user?->unitKerja;
@@ -270,11 +363,20 @@ class AdminUserController extends Controller
     // =========================
     // DAFTAR SHORT LINK
     // =========================
-    public function shortLinks()
+    public function shortLinks(Request $request)
     {
-        $shortLinks = ShortLink::with(['user.unitKerja'])
-            ->latest()
-            ->get();
+        $user = $request->user();
+
+        $query = ShortLink::with(['user.unitKerja', 'lockedUnitKerja']);
+
+        // admin_unit → hanya shortlink dari user di OPD-nya
+        if ($this->isAdminUnit($user)) {
+            $query->whereHas('user', function ($q) use ($user) {
+                $q->where('unit_kerja_id', $user->unit_kerja_id);
+            });
+        }
+
+        $shortLinks = $query->latest()->get();
 
         return response()->json([
             'message' => 'Data short link berhasil diambil.',
@@ -288,7 +390,18 @@ class AdminUserController extends Controller
     // =========================
     public function updateShortLink(Request $request, $id)
     {
-        $shortLink = ShortLink::findOrFail($id);
+        $requester = $request->user();
+
+        $shortLink = ShortLink::with('user')->findOrFail($id);
+
+        // Guard: admin_unit hanya bisa edit shortlink dari OPD-nya
+        if ($this->isAdminUnit($requester)) {
+            if ($shortLink->user?->unit_kerja_id !== $requester->unit_kerja_id) {
+                return response()->json([
+                    'message' => 'Anda hanya bisa mengelola short link dari unit kerja Anda.',
+                ], 403);
+            }
+        }
 
         $request->validate([
             'original_url' => 'required|url',
@@ -332,9 +445,20 @@ class AdminUserController extends Controller
     // =========================
     // UBAH STATUS SHORT LINK
     // =========================
-    public function toggleShortLink($id)
+    public function toggleShortLink(Request $request, $id)
     {
-        $shortLink = ShortLink::findOrFail($id);
+        $requester = $request->user();
+
+        $shortLink = ShortLink::with('user')->findOrFail($id);
+
+        // Guard: admin_unit hanya bisa toggle shortlink dari OPD-nya
+        if ($this->isAdminUnit($requester)) {
+            if ($shortLink->user?->unit_kerja_id !== $requester->unit_kerja_id) {
+                return response()->json([
+                    'message' => 'Anda hanya bisa mengelola short link dari unit kerja Anda.',
+                ], 403);
+            }
+        }
 
         $shortLink->update([
             'status' => !$shortLink->status,
@@ -363,9 +487,20 @@ class AdminUserController extends Controller
     // =========================
     // HAPUS SHORT LINK
     // =========================
-    public function deleteShortLink($id)
+    public function deleteShortLink(Request $request, $id)
     {
-        $shortLink = ShortLink::findOrFail($id);
+        $requester = $request->user();
+
+        $shortLink = ShortLink::with('user')->findOrFail($id);
+
+        // Guard: admin_unit hanya bisa hapus shortlink dari OPD-nya
+        if ($this->isAdminUnit($requester)) {
+            if ($shortLink->user?->unit_kerja_id !== $requester->unit_kerja_id) {
+                return response()->json([
+                    'message' => 'Anda hanya bisa mengelola short link dari unit kerja Anda.',
+                ], 403);
+            }
+        }
 
         AuditLogService::log(
             'shortlink.deleted',
@@ -391,36 +526,84 @@ class AdminUserController extends Controller
     // HAPUS USER
     // =========================
     public function destroy(Request $request, $id)
-    {
-        $user = User::find($id);
+{
+    $requester = $request->user();
 
-        if (!$user) {
-            return response()->json([
-                'message' => 'User tidak ditemukan.',
-            ], 404);
-        }
+    $user = User::find($id);
 
-        // Cegah admin hapus dirinya sendiri
-        if ($request->user()->id == $user->id) {
-            return response()->json([
-                'message' => 'Anda tidak bisa menghapus akun Anda sendiri.',
-            ], 403);
-        }
-
-        // Cegah admin biasa hapus super_admin
-        if (
-            strtolower($user->role) === 'super_admin' &&
-            strtolower($request->user()->role) !== 'super_admin'
-        ) {
-            return response()->json([
-                'message' => 'Hanya Super Admin yang bisa menghapus akun Super Admin.',
-            ], 403);
-        }
-
-        $user->delete();
-
+    if (!$user) {
         return response()->json([
-            'message' => 'User berhasil dihapus.',
-        ]);
+            'message' => 'User tidak ditemukan.',
+        ], 404);
     }
+
+    // Cegah admin hapus dirinya sendiri
+    if ($requester->id == $user->id) {
+        return response()->json([
+            'message' => 'Anda tidak bisa menghapus akun Anda sendiri.',
+        ], 403);
+    }
+
+    // Guard: admin_unit hanya bisa hapus user dari OPD-nya
+    if ($this->isAdminUnit($requester)) {
+        if ($user->unit_kerja_id !== $requester->unit_kerja_id) {
+            return response()->json([
+                'message' => 'Anda hanya bisa menghapus user dari unit kerja Anda.',
+            ], 403);
+        }
+    }
+
+    // Cegah admin biasa hapus super_admin
+    if (
+        strtolower($user->role) === 'super_admin' &&
+        !$this->isSuperAdmin($requester)
+    ) {
+        return response()->json([
+            'message' => 'Hanya Super Admin yang bisa menghapus akun Super Admin.',
+        ], 403);
+    }
+
+    // =====================================================
+    // CASCADE DELETE — Hapus semua data milik user ini
+    // =====================================================
+
+    // 1. Hapus semua CLICKS dari short link milik user
+    \App\Models\ShortLinkClick::whereIn(
+        'short_link_id',
+        \App\Models\ShortLink::where('user_id', $user->id)->pluck('id')
+    )->delete();
+
+    // 2. Hapus semua SHORT LINK milik user
+    $shortLinkCount = \App\Models\ShortLink::where('user_id', $user->id)->count();
+    \App\Models\ShortLink::where('user_id', $user->id)->delete();
+
+    // 3. Hapus semua ITEMS dari link hub milik user
+    \App\Models\LinkHubItem::whereIn(
+        'link_hub_id',
+        \App\Models\LinkHub::where('user_id', $user->id)->pluck('id')
+    )->delete();
+
+    // 4. Hapus semua LINK HUB milik user
+    $linkHubCount = \App\Models\LinkHub::where('user_id', $user->id)->count();
+    \App\Models\LinkHub::where('user_id', $user->id)->delete();
+
+    // 5. Hapus semua FEEDBACK milik user
+    \App\Models\Feedback::where('user_id', $user->id)->delete();
+
+    // 6. Hapus semua TOKEN (personal access token)
+    $user->tokens()->delete();
+
+    // 7. Terakhir, hapus USER-nya
+    $user->delete();
+
+    return response()->json([
+        'message' => 'User berhasil dihapus.',
+        'deleted' => [
+            'user' => $user->name,
+            'email' => $user->email,
+            'short_links_deleted' => $shortLinkCount,
+            'link_hubs_deleted' => $linkHubCount,
+        ],
+    ]);
+}
 }

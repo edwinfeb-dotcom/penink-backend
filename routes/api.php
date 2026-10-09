@@ -59,6 +59,7 @@ Route::get('/integration/statistics', [StatisticsApiController::class, 'index'])
     ->middleware('statistics.api.key');
 
 Route::middleware('auth:sanctum')->group(function () {
+     Route::get('/short-links/{code}/resolve', [ShortLinkController::class, 'resolve']);
     Route::get('/settings', [\App\Http\Controllers\Api\SettingController::class, 'index']);
     Route::post('/feedbacks', [FeedbackController::class, 'store']);
     
