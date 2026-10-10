@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use Illuminate\Support\Facades\Storage;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Models\UnitKerja;
@@ -525,85 +526,93 @@ class AdminUserController extends Controller
     // =========================
     // HAPUS USER
     // =========================
-    public function destroy(Request $request, $id)
-{
-    $requester = $request->user();
+       public function destroy(Request $request, $id)
+    {
+        $requester = $request->user();
 
-    $user = User::find($id);
+        $user = User::find($id);
 
-    if (!$user) {
-        return response()->json([
-            'message' => 'User tidak ditemukan.',
-        ], 404);
-    }
-
-    // Cegah admin hapus dirinya sendiri
-    if ($requester->id == $user->id) {
-        return response()->json([
-            'message' => 'Anda tidak bisa menghapus akun Anda sendiri.',
-        ], 403);
-    }
-
-    // Guard: admin_unit hanya bisa hapus user dari OPD-nya
-    if ($this->isAdminUnit($requester)) {
-        if ($user->unit_kerja_id !== $requester->unit_kerja_id) {
+        if (!$user) {
             return response()->json([
-                'message' => 'Anda hanya bisa menghapus user dari unit kerja Anda.',
+                'message' => 'User tidak ditemukan.',
+            ], 404);
+        }
+
+        // Cegah admin hapus dirinya sendiri
+        if ($requester->id == $user->id) {
+            return response()->json([
+                'message' => 'Anda tidak bisa menghapus akun Anda sendiri.',
             ], 403);
         }
-    }
 
-    // Cegah admin biasa hapus super_admin
-    if (
-        strtolower($user->role) === 'super_admin' &&
-        !$this->isSuperAdmin($requester)
-    ) {
+        // Guard: admin_unit hanya bisa hapus user dari OPD-nya
+        if ($this->isAdminUnit($requester)) {
+            if ($user->unit_kerja_id !== $requester->unit_kerja_id) {
+                return response()->json([
+                    'message' => 'Anda hanya bisa menghapus user dari unit kerja Anda.',
+                ], 403);
+            }
+        }
+
+        // Cegah admin biasa hapus super_admin
+        if (
+            strtolower($user->role) === 'super_admin' &&
+            !$this->isSuperAdmin($requester)
+        ) {
+            return response()->json([
+                'message' => 'Hanya Super Admin yang bisa menghapus akun Super Admin.',
+            ], 403);
+        }
+
+        // =====================================================
+        // CASCADE DELETE — Hapus semua data milik user ini
+        // =====================================================
+
+        // 1. Hapus semua CLICKS dari short link milik user
+        \App\Models\ShortLinkClick::whereIn(
+            'short_link_id',
+            \App\Models\ShortLink::where('user_id', $user->id)->pluck('id')
+        )->delete();
+
+        // 2. Hapus semua SHORT LINK milik user
+        $shortLinkCount = \App\Models\ShortLink::where('user_id', $user->id)->count();
+        \App\Models\ShortLink::where('user_id', $user->id)->delete();
+
+        // 3. ✨ Hapus FILE LOGO dari semua LinkHub milik user
+        $userLinkHubs = \App\Models\LinkHub::where('user_id', $user->id)->get();
+        foreach ($userLinkHubs as $hub) {
+            if ($hub->logo_path && \Storage::disk('public')->exists($hub->logo_path)) {
+                \Storage::disk('public')->delete($hub->logo_path);
+            }
+        }
+
+        // 4. Hapus semua ITEMS dari link hub milik user
+        \App\Models\LinkHubItem::whereIn(
+            'link_hub_id',
+            \App\Models\LinkHub::where('user_id', $user->id)->pluck('id')
+        )->delete();
+
+        // 5. Hapus semua LINK HUB milik user
+        $linkHubCount = \App\Models\LinkHub::where('user_id', $user->id)->count();
+        \App\Models\LinkHub::where('user_id', $user->id)->delete();
+
+        // 6. Hapus semua FEEDBACK milik user
+        \App\Models\Feedback::where('user_id', $user->id)->delete();
+
+        // 7. Hapus semua TOKEN (personal access token)
+        $user->tokens()->delete();
+
+        // 8. Terakhir, hapus USER-nya
+        $user->delete();
+
         return response()->json([
-            'message' => 'Hanya Super Admin yang bisa menghapus akun Super Admin.',
-        ], 403);
+            'message' => 'User berhasil dihapus.',
+            'deleted' => [
+                'user' => $user->name,
+                'email' => $user->email,
+                'short_links_deleted' => $shortLinkCount,
+                'link_hubs_deleted' => $linkHubCount,
+            ],
+        ]);
     }
-
-    // =====================================================
-    // CASCADE DELETE — Hapus semua data milik user ini
-    // =====================================================
-
-    // 1. Hapus semua CLICKS dari short link milik user
-    \App\Models\ShortLinkClick::whereIn(
-        'short_link_id',
-        \App\Models\ShortLink::where('user_id', $user->id)->pluck('id')
-    )->delete();
-
-    // 2. Hapus semua SHORT LINK milik user
-    $shortLinkCount = \App\Models\ShortLink::where('user_id', $user->id)->count();
-    \App\Models\ShortLink::where('user_id', $user->id)->delete();
-
-    // 3. Hapus semua ITEMS dari link hub milik user
-    \App\Models\LinkHubItem::whereIn(
-        'link_hub_id',
-        \App\Models\LinkHub::where('user_id', $user->id)->pluck('id')
-    )->delete();
-
-    // 4. Hapus semua LINK HUB milik user
-    $linkHubCount = \App\Models\LinkHub::where('user_id', $user->id)->count();
-    \App\Models\LinkHub::where('user_id', $user->id)->delete();
-
-    // 5. Hapus semua FEEDBACK milik user
-    \App\Models\Feedback::where('user_id', $user->id)->delete();
-
-    // 6. Hapus semua TOKEN (personal access token)
-    $user->tokens()->delete();
-
-    // 7. Terakhir, hapus USER-nya
-    $user->delete();
-
-    return response()->json([
-        'message' => 'User berhasil dihapus.',
-        'deleted' => [
-            'user' => $user->name,
-            'email' => $user->email,
-            'short_links_deleted' => $shortLinkCount,
-            'link_hubs_deleted' => $linkHubCount,
-        ],
-    ]);
-}
 }

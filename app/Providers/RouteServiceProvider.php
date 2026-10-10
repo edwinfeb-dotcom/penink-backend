@@ -22,30 +22,52 @@ class RouteServiceProvider extends ServiceProvider
     /**
      * Define your route model bindings, pattern filters, and other route configuration.
      */
-    public function boot(): void
+        public function boot(): void
     {
-    RateLimiter::for('api', function (Request $request) {
-        return Limit::perMinute(60)->by(
-            $request->user()?->id ?: $request->ip()
-        );
-    });
+        // Rate limit umum untuk API (60 req/menit)
+        RateLimiter::for('api', function (Request $request) {
+            return Limit::perMinute(60)->by(
+                $request->user()?->id ?: $request->ip()
+            );
+        });
 
-    RateLimiter::for('login', function (Request $request) {
-        return Limit::perMinute(5)->by($request->ip());
-    });
-    RateLimiter::for('shortlink-create', function (Request $request) {
-    return Limit::perMinute(10)->by(
-        $request->user()?->id ?: $request->ip()
-    );
-});
+        // ✨ Rate limit LOGIN — cegah brute force (5 attempt/menit per IP+login)
+        RateLimiter::for('login', function (Request $request) {
+            $key = 'login:' . $request->ip() . ':' . ($request->input('login') ?? '');
+            return Limit::perMinute(5)
+                ->by($key)
+                ->response(function () {
+                    return response()->json([
+                        'message' => 'Terlalu banyak percobaan login. Coba lagi dalam 1 menit.',
+                    ], 429);
+                });
+        });
 
-    $this->routes(function () {
-        Route::middleware('api')
-            ->prefix('api')
-            ->group(base_path('routes/api.php'));
+        // ✨ Rate limit REGISTER (3 akun/menit per IP)
+        RateLimiter::for('register', function (Request $request) {
+            return Limit::perMinute(3)
+                ->by($request->ip())
+                ->response(function () {
+                    return response()->json([
+                        'message' => 'Terlalu banyak percobaan registrasi. Coba lagi nanti.',
+                    ], 429);
+                });
+        });
 
-        Route::middleware('web')
-            ->group(base_path('routes/web.php'));
-    });
+        // Rate limit untuk create short link (10 req/menit)
+        RateLimiter::for('shortlink-create', function (Request $request) {
+            return Limit::perMinute(10)->by(
+                $request->user()?->id ?: $request->ip()
+            );
+        });
+
+        $this->routes(function () {
+            Route::middleware('api')
+                ->prefix('api')
+                ->group(base_path('routes/api.php'));
+
+            Route::middleware('web')
+                ->group(base_path('routes/web.php'));
+        });
     }
 }

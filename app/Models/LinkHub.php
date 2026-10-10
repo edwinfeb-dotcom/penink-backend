@@ -18,8 +18,20 @@ class LinkHub extends Model
         'short_code',
         'type',
         'status',
-        'locked_unit_kerja_id', // <--- TAMBAHAN BARU
+        'locked_unit_kerja_id',
+         'logo_path', 
     ];
+
+    // Accessor biar otomatis dapat URL lengkap
+protected $appends = ['logo_url'];
+
+public function getLogoUrlAttribute()
+{
+    if (!$this->logo_path) {
+        return null;
+    }
+    return asset('storage/' . $this->logo_path);
+}
 
     protected $casts = [
         'status' => 'boolean',

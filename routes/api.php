@@ -17,10 +17,11 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user()->load('unitKerja');
 });
 
-Route::middleware('throttle:login')->group(function () {
-    Route::post('/login', [AuthController::class, 'login']);
-    Route::post('/register', [AuthController::class, 'register']);
-});
+Route::post('/login', [AuthController::class, 'login'])
+    ->middleware('throttle:login');
+
+Route::post('/register', [AuthController::class, 'register'])
+    ->middleware('throttle:register');
 
 Route::get('/public/link-hubs/{shortCode}', [LinkHubController::class, 'publicShow']);
 Route::get('/unit-kerjas', function () {
