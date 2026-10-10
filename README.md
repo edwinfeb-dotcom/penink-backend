@@ -1,66 +1,290 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Panduan Deploy PENINK ke Server Kominfo
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+## 📋 Prasyarat Server
 
-## About Laravel
+- **OS:** Ubuntu 22.04 LTS / Windows Server (sesuai kebijakan Diskominfo)
+- **Web Server:** Nginx atau Apache
+- **PHP:** 8.1+ dengan ekstensi lengkap
+- **Database:** MySQL 8.0+ atau MariaDB 10.3+
+- **Composer:** 2.x
+- **Git:** untuk pull source code
+- **SSL Certificate:** dari Let's Encrypt atau dari Diskominfo
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## 🚀 Langkah Deployment
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+### 1. Setup Server (sekali saja)
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+Install dependency:
 
-## Learning Laravel
+```bash
+sudo apt update
+sudo apt install -y php8.1-fpm php8.1-mysql php8.1-mbstring php8.1-xml \
+  php8.1-bcmath php8.1-curl php8.1-gd php8.1-zip mysql-server nginx git unzip
+```
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+Install Composer:
 
-You may also try the [Laravel Bootcamp](https://bootcamp.laravel.com), where you will be guided through building a modern Laravel application from scratch.
+```bash
+curl -sS https://getcomposer.org/installer | php
+sudo mv composer.phar /usr/local/bin/composer
+```
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+Install Node.js (untuk build frontend):
 
-## Laravel Sponsors
+```bash
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt install -y nodejs
+```
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+### 2. Setup Database
 
-### Premium Partners
+Login ke MySQL:
 
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[WebReinvent](https://webreinvent.com/)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Jump24](https://jump24.co.uk)**
-- **[Redberry](https://redberry.international/laravel/)**
-- **[Active Logic](https://activelogic.com)**
-- **[byte5](https://byte5.de)**
-- **[OP.GG](https://op.gg)**
+```bash
+sudo mysql
+```
 
-## Contributing
+Bikin database & user:
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+```sql
+CREATE DATABASE penink_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'penink_user'@'localhost' IDENTIFIED BY 'PASSWORD_KUAT_ANDA';
+GRANT ALL PRIVILEGES ON penink_db.* TO 'penink_user'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+```
 
-## Code of Conduct
+### 3. Deploy Backend
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+```bash
+cd /var/www
+sudo git clone https://github.com/edwinfeb-dotcom/penink-backend.git
+cd penink-backend
 
-## Security Vulnerabilities
+# Install dependencies (production mode)
+sudo composer install --no-dev --optimize-autoloader
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+# Setup environment
+sudo cp .env.example .env
+sudo nano .env
+```
 
-## License
+**Edit `.env` untuk production:**
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+```env
+APP_NAME=PENINK
+APP_ENV=production
+APP_DEBUG=false    # ← WAJIB false!
+APP_URL=https://penink.landak.go.id
+
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=penink_db
+DB_USERNAME=penink_user
+DB_PASSWORD=PASSWORD_KUAT_ANDA
+
+SANCTUM_STATEFUL_DOMAINS=penink.landak.go.id
+
+GOOGLE_CLIENT_ID=xxx
+GOOGLE_CLIENT_SECRET=xxx
+GOOGLE_REDIRECT_URI=https://penink.landak.go.id/api/auth/google/callback
+```
+
+**Generate key & migrate:**
+
+```bash
+sudo php artisan key:generate
+sudo php artisan migrate --force
+sudo php artisan storage:link
+```
+
+**Set permission:**
+
+```bash
+sudo chown -R www-data:www-data storage bootstrap/cache
+sudo chmod -R 775 storage bootstrap/cache
+```
+
+### 4. Deploy Frontend
+
+```bash
+cd /var/www/penink-frontend
+sudo git clone https://github.com/edwinfeb-dotcom/penink-frontend.git .
+sudo npm install
+```
+
+Bikin `.env`:
+
+```env
+VITE_API_URL=https://penink.landak.go.id
+```
+
+Build:
+
+```bash
+sudo npm run build
+```
+
+Hasil build ada di `dist/`. Copy ke folder yang bisa diakses Nginx:
+
+```bash
+sudo cp -r dist/* /var/www/penink-backend/public/
+```
+
+### 5. Setup Nginx
+
+Bikin file `/etc/nginx/sites-available/penink`:
+
+```nginx
+server {
+    listen 80;
+    server_name penink.landak.go.id;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name penink.landak.go.id;
+
+    root /var/www/penink-backend/public;
+    index index.php index.html;
+
+    # SSL (Let's Encrypt)
+    ssl_certificate /etc/letsencrypt/live/penink.landak.go.id/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/penink.landak.go.id/privkey.pem;
+
+    # Security headers (sebagian sudah di middleware Laravel)
+    server_tokens off;
+
+    # Logs
+    access_log /var/log/nginx/penink-access.log;
+    error_log /var/log/nginx/penink-error.log;
+
+    # Frontend SPA — arahkan ke index.html kalau bukan file/folder
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API — arahkan ke Laravel
+    location /api {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # PHP-FPM
+    location ~ \.php$ {
+        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # Block hidden files
+    location ~ /\. {
+        deny all;
+    }
+}
+```
+
+Enable site:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/penink /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 6. Setup SSL (Let's Encrypt)
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d penink.landak.go.id
+```
+
+### 7. Setup Cron untuk Laravel Scheduler
+
+```bash
+sudo crontab -e -u www-data
+```
+
+Tambah:
+
+```
+* * * * * cd /var/www/penink-backend && php artisan schedule:run >> /dev/null 2>&1
+```
+
+## 🔄 Cara Update Aplikasi
+
+Kalau ada update dari developer:
+
+```bash
+cd /var/www/penink-backend
+sudo git pull origin main
+sudo composer install --no-dev --optimize-autoloader
+sudo php artisan migrate --force
+sudo php artisan optimize:clear
+sudo php artisan config:cache
+sudo php artisan route:cache
+sudo php artisan view:cache
+sudo chown -R www-data:www-data storage bootstrap/cache
+```
+
+Untuk frontend:
+
+```bash
+cd /var/www/penink-frontend
+sudo git pull origin main
+sudo npm install
+sudo npm run build
+sudo cp -r dist/* /var/www/penink-backend/public/
+```
+
+## 💾 Backup Rutin
+
+Bikin script backup di `/home/backup/penink-backup.sh`:
+
+```bash
+#!/bin/bash
+BACKUP_DIR="/home/backup/penink"
+DATE=$(date +%Y%m%d_%H%M%S)
+mkdir -p $BACKUP_DIR
+
+# Backup database
+mysqldump -u penink_user -p'PASSWORD' penink_db > $BACKUP_DIR/db_$DATE.sql
+
+# Backup storage (logo uploads)
+tar -czf $BACKUP_DIR/storage_$DATE.tar.gz /var/www/penink-backend/storage/app/public
+
+# Hapus backup lebih dari 30 hari
+find $BACKUP_DIR -type f -mtime +30 -delete
+```
+
+Set cron untuk backup harian jam 2 pagi:
+
+```
+0 2 * * * /bin/bash /home/backup/penink-backup.sh
+```
+
+## 🚨 Troubleshooting
+
+### "502 Bad Gateway"
+
+- Cek PHP-FPM: `sudo systemctl status php8.1-fpm`
+- Restart: `sudo systemctl restart php8.1-fpm`
+
+### "500 Internal Server Error"
+
+- Cek log Laravel: `tail -f /var/www/penink-backend/storage/logs/laravel.log`
+- Cek permission: `sudo chmod -R 775 storage bootstrap/cache`
+
+### Logo upload gagal
+
+- Cek folder: `ls -la /var/www/penink-backend/storage/app/public/link-hub-logos`
+- Cek permission: `sudo chown -R www-data:www-data storage`
+
+### SSL error
+
+- Cek certificate: `sudo certbot certificates`
+- Renew: `sudo certbot renew --dry-run`
+
+## 📞 Kontak
+
+Untuk kendala deployment, hubungi developer: [Nama Kamu]
