@@ -6,23 +6,17 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
         Schema::table('short_links', function (Blueprint $table) {
-            //
+            $table->string('type', 10)->default('UMUM')->after('short_code');
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
         Schema::table('short_links', function (Blueprint $table) {
-            //
+            $table->dropColumn('type');
         });
     }
 };
