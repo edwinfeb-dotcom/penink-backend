@@ -1,3 +1,4 @@
+# === Laravel Default ===
 /.phpunit.cache
 /node_modules
 /public/build
@@ -17,3 +18,22 @@ yarn-error.log
 /.fleet
 /.idea
 /.vscode
+
+# === React Build (JANGAN di-commit!) ===
+/public/assets/
+/public/index.html
+/public/site.webmanifest
+/public/*.zip
+/public/icons.svg
+/public/favicon*.png
+/public/favicon*.ico
+/public/favicon.svg
+/public/apple-touch-icon.png
+/public/android-chrome-*.png
+/public/Lambang_Kabupaten_Landak.png
+/public/logo-*.png
+/public/logo-landak.png
+
+# === File SQL Backup (JANGAN di-commit!) ===
+*.sql
+backup_*.sql
