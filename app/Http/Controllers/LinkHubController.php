@@ -9,6 +9,7 @@ use App\Models\ShortLink;
 use App\Models\LockedAlias;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
 class LinkHubController extends Controller
 {
@@ -31,7 +32,7 @@ class LinkHubController extends Controller
         return strtolower($user->role) === 'admin_unit';
     }
 
-        public function index(Request $request)
+    public function index(Request $request)
     {
         $user = $request->user();
 
@@ -59,70 +60,114 @@ class LinkHubController extends Controller
     }
 
     public function store(Request $request)
-{
-    // PAKSA SHORT_CODE JADI LOWERCASE
-    if ($request->filled('short_code')) {
-        $request->merge([
-            'short_code' => strtolower($request->short_code),
+    {
+        // 1. VALIDASI DASAR (TANPA PAKSA LOWERCASE & ALIAS NULLABLE)
+        $request->validate([
+            'title' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'type' => 'required|in:ASN,UMUM',
+            'short_code' => [
+                'nullable', // ✨ Ubah jadi nullable
+                'alpha_dash',
+                function ($attribute, $value, $fail) {
+                    if (!$value) return;
+
+                    $valueLower = strtolower($value);
+                    $reservedAliases = [
+                        'admin', 'login', 'register', 'api',
+                        'dashboard', 'user', 'settings',
+                    ];
+
+                    if (in_array($valueLower, $reservedAliases, true)) {
+                        $fail('Alias ini tidak dapat digunakan karena termasuk alias yang dicadangkan.');
+                        return;
+                    }
+
+                    // Cek case-sensitive ke tabel ShortLink
+                    if (ShortLink::whereRaw('BINARY short_code = ?', [$value])->exists()) {
+                        $fail('Alias tersebut sudah digunakan oleh Short Link. Silakan pilih alias lain.');
+                    }
+                },
+            ],
+            'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
+        ], [
+            'title.required' => 'Judul Link Hub wajib diisi.',
+            'short_code.alpha_dash' => 'Alias hanya boleh berisi huruf, angka, tanda hubung (-), dan garis bawah (_).',
+            'type.required' => 'Jenis Link Hub wajib dipilih.',
+            'type.in' => 'Jenis Link Hub harus ASN atau UMUM.',
+            'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
-    }
 
-    // VALIDASI DASAR
-    $request->validate([
-        'title' => 'required|string|max:255',
-        'description' => 'nullable|string',
-        'type' => 'required|in:ASN,UMUM',
-        'short_code' => [
-            'required',
-            'alpha_dash',
-            function ($attribute, $value, $fail) {
-                $value = strtolower($value);
+        $user = $request->user();
+        
+        // 2. JIKA ALIAS KOSONG, BUATKAN RANDOM STRING
+        $alias = $request->short_code;
+        if (!$alias) {
+            do {
+                $alias = Str::random(5);
+            } while (
+                LinkHub::whereRaw('BINARY short_code = ?', [$alias])->exists() || 
+                ShortLink::whereRaw('BINARY short_code = ?', [$alias])->exists()
+            );
+        }
 
-                $reservedAliases = [
-                    'admin', 'login', 'register', 'api',
-                    'dashboard', 'user', 'settings',
-                ];
+        $userUnitKerjaId = $user->unit_kerja_id;
+        $isSuperAdmin = strtolower($user->role) === 'super_admin';
 
-                if (in_array($value, $reservedAliases, true)) {
-                    $fail('Alias ini tidak dapat digunakan karena termasuk alias yang dicadangkan.');
-                    return;
+        // =====================================================
+        // CEK LOCKED ALIAS
+        // =====================================================
+        $locked = LockedAlias::where('alias', strtolower($alias))->first();
+
+        if ($locked && !$isSuperAdmin) {
+            // KASUS 1: Alias terkunci untuk OPD user sendiri → AUTO-CLAIM
+            if ((int) $locked->unit_kerja_id === (int) $userUnitKerjaId) {
+                $existingHub = LinkHub::whereRaw('BINARY short_code = ?', [$alias])->first();
+
+                if ($existingHub) {
+                    $existingHub->update([
+                        'user_id' => $user->id,
+                        'title' => $request->title,
+                        'description' => $request->description,
+                        'type' => $request->type,
+                        'locked_unit_kerja_id' => $request->locked_unit_kerja_id
+                            ?? $existingHub->locked_unit_kerja_id,
+                    ]);
+
+                    $existingHub->load('items', 'lockedUnitKerja');
+
+                    AuditLogService::log(
+                        'linkhub.claimed', 'LinkHub', $existingHub->id,
+                        'Link Hub diklaim oleh OPD pemilik alias',
+                        ['title' => $existingHub->title, 'short_code' => $existingHub->short_code, 'claimed_by_user_id' => $user->id]
+                    );
+
+                    return response()->json([
+                        'message' => 'Link Hub berhasil dibuat.',
+                        'data' => $existingHub,
+                    ], 200);
                 }
+            }
 
-                if (ShortLink::where('short_code', $value)->exists()) {
-                    $fail('Alias tersebut sudah digunakan oleh Short Link. Silakan pilih alias lain.');
-                }
-            },
-        ],
-        'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
-    ], [
-        'title.required' => 'Judul Link Hub wajib diisi.',
-        'short_code.required' => 'Alias Link Hub wajib diisi.',
-        'short_code.alpha_dash' => 'Alias hanya boleh berisi huruf, angka, tanda hubung (-), dan garis bawah (_).',
-        'type.required' => 'Jenis Link Hub wajib dipilih.',
-        'type.in' => 'Jenis Link Hub harus ASN atau UMUM.',
-        'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
-    ]);
+            // KASUS 2: Alias terkunci untuk OPD LAIN → TOLAK
+            if ((int) $locked->unit_kerja_id !== (int) $userUnitKerjaId) {
+                $namaOpd = $locked->unitKerja?->nama_unit_kerja ?? 'OPD lain';
+                return response()->json([
+                    'message' => "Alias '{$alias}' dikunci untuk {$namaOpd}. Silakan pakai alias lain.",
+                    'error_code' => 'alias_locked_to_other',
+                ], 400);
+            }
+        }
 
-    $user = $request->user();
-    $alias = strtolower($request->short_code);
-    $userUnitKerjaId = $user->unit_kerja_id;
-    $isSuperAdmin = strtolower($user->role) === 'super_admin';
+        // =====================================================
+        // CEK LINKHUB EXISTING (untuk alias tanpa lock)
+        // =====================================================
+        $existingHub = LinkHub::whereRaw('BINARY short_code = ?', [$alias])->first();
 
-    // =====================================================
-    // ✨ CEK LOCKED ALIAS — DI LUAR if ($existingHub)
-    //    Berlaku baik LinkHub existing ada maupun tidak
-    // =====================================================
-    $locked = LockedAlias::where('alias', $alias)->first();
-
-    if ($locked && !$isSuperAdmin) {
-        // KASUS 1: Alias terkunci untuk OPD user sendiri → AUTO-CLAIM
-        if ((int) $locked->unit_kerja_id === (int) $userUnitKerjaId) {
-            $existingHub = LinkHub::where('short_code', $alias)->first();
-
-            if ($existingHub) {
-                // LinkHub existing ada → update jadi milik user
+        if ($existingHub) {
+            // Kasus 3: Alias milik user sendiri → update saja
+            if ((int) $existingHub->user_id === (int) $user->id) {
                 $existingHub->update([
-                    'user_id' => $user->id,
                     'title' => $request->title,
                     'description' => $request->description,
                     'type' => $request->type,
@@ -132,134 +177,69 @@ class LinkHubController extends Controller
 
                 $existingHub->load('items', 'lockedUnitKerja');
 
-                AuditLogService::log(
-                    'linkhub.claimed',
-                    'LinkHub',
-                    $existingHub->id,
-                    'Link Hub diklaim oleh OPD pemilik alias',
-                    [
-                        'title' => $existingHub->title,
-                        'short_code' => $existingHub->short_code,
-                        'claimed_by_user_id' => $user->id,
-                    ]
-                );
-
                 return response()->json([
-                    'message' => 'Link Hub berhasil dibuat.',
+                    'message' => 'Link Hub berhasil diperbarui.',
                     'data' => $existingHub,
                 ], 200);
             }
-            // Kalau LinkHub existing tidak ada → lanjut buat baru di bawah (user OPD sendiri)
-        }
 
-        // KASUS 2: Alias terkunci untuk OPD LAIN → TOLAK
-        if ((int) $locked->unit_kerja_id !== (int) $userUnitKerjaId) {
-            $namaOpd = $locked->unitKerja?->nama_unit_kerja ?? 'OPD lain';
+            // Kasus 4: Alias milik orang lain & tidak terkunci
             return response()->json([
-                'message' => "Alias '{$alias}' dikunci untuk {$namaOpd}. Silakan pakai alias lain.",
-                'error_code' => 'alias_locked_to_other',
+                'message' => 'Alias Link Hub sudah digunakan.',
+                'error_code' => 'alias_taken',
             ], 400);
         }
-    }
 
-    // =====================================================
-    // CEK LINKHUB EXISTING (untuk alias tanpa lock)
-    // =====================================================
-    $existingHub = LinkHub::where('short_code', $alias)->first();
-
-    if ($existingHub) {
-        // Kasus 3: Alias milik user sendiri → update saja
-        if ((int) $existingHub->user_id === (int) $user->id) {
-            $existingHub->update([
-                'title' => $request->title,
-                'description' => $request->description,
-                'type' => $request->type,
-                'locked_unit_kerja_id' => $request->locked_unit_kerja_id
-                    ?? $existingHub->locked_unit_kerja_id,
+        // =====================================================
+        // LOLOS SEMUA CEK → BUAT LINK HUB BARU
+        // =====================================================
+        $logoPath = null;
+        if ($request->hasFile('logo')) {
+            $request->validate([
+                'logo' => 'image|mimes:png,jpg,jpeg,svg,webp|max:2048',
+            ], [
+                'logo.image' => 'File harus berupa gambar.',
+                'logo.mimes' => 'Format logo harus PNG, JPG, JPEG, SVG, atau WEBP.',
+                'logo.max' => 'Ukuran logo maksimal 2MB.',
             ]);
 
-            $existingHub->load('items', 'lockedUnitKerja');
-
-            return response()->json([
-                'message' => 'Link Hub berhasil diperbarui.',
-                'data' => $existingHub,
-            ], 200);
+            $logoPath = $request->file('logo')->store('link-hub-logos', 'public');
         }
 
-        // Kasus 4: Alias milik orang lain & tidak terkunci
-        return response()->json([
-            'message' => 'Alias Link Hub sudah digunakan.',
-            'error_code' => 'alias_taken',
-        ], 400);
-    }
-
-    // =====================================================
-    // LOLOS SEMUA CEK → BUAT LINK HUB BARU
-    // =====================================================
-    $logoPath = null;
-    if ($request->hasFile('logo')) {
-        $request->validate([
-            'logo' => 'image|mimes:png,jpg,jpeg,svg,webp|max:2048',
-        ], [
-            'logo.image' => 'File harus berupa gambar.',
-            'logo.mimes' => 'Format logo harus PNG, JPG, JPEG, SVG, atau WEBP.',
-            'logo.max' => 'Ukuran logo maksimal 2MB.',
+        $linkHub = LinkHub::create([
+            'user_id' => $user->id,
+            'title' => $request->title,
+            'description' => $request->description,
+            'short_code' => $alias, // Simpan persis seperti yang diketik
+            'type' => $request->type,
+            'status' => true,
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
+            'logo_path' => $logoPath,
         ]);
 
-        $logoPath = $request->file('logo')->store('link-hub-logos', 'public');
+        $linkHub->load('lockedUnitKerja');
+
+        AuditLogService::log(
+            'linkhub.created', 'LinkHub', $linkHub->id,
+            'Link Hub berhasil dibuat',
+            ['title' => $linkHub->title, 'short_code' => $linkHub->short_code, 'type' => $linkHub->type, 'locked_unit_kerja_id' => $linkHub->locked_unit_kerja_id]
+        );
+
+        return response()->json([
+            'message' => 'Link Hub berhasil dibuat.',
+            'data' => $linkHub,
+        ], 201);
     }
 
-    $linkHub = LinkHub::create([
-        'user_id' => $user->id,
-        'title' => $request->title,
-        'description' => $request->description,
-        'short_code' => $alias,
-        'type' => $request->type,
-        'status' => true,
-        'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
-        'logo_path' => $logoPath,
-    ]);
-
-    $linkHub->load('lockedUnitKerja');
-
-    AuditLogService::log(
-        'linkhub.created',
-        'LinkHub',
-        $linkHub->id,
-        'Link Hub berhasil dibuat',
-        [
-            'title' => $linkHub->title,
-            'short_code' => $linkHub->short_code,
-            'type' => $linkHub->type,
-            'locked_unit_kerja_id' => $linkHub->locked_unit_kerja_id,
-        ]
-    );
-
-    return response()->json([
-        'message' => 'Link Hub berhasil dibuat.',
-        'data' => $linkHub,
-    ], 201);
-}
-
-    /**
-     * Helper: ambil LinkHub dengan guard admin_unit
-     */
     private function findLinkHub(Request $request, $id)
     {
         $user = $request->user();
 
         if ($this->isAdminUnit($user)) {
-            $linkHub = LinkHub::with('user')
-                ->where('id', $id)
-                ->firstOrFail();
-
+            $linkHub = LinkHub::with('user')->where('id', $id)->firstOrFail();
             if ($linkHub->user?->unit_kerja_id !== $user->unit_kerja_id) {
-                abort(response()->json([
-                    'success' => false,
-                    'message' => 'Anda hanya bisa mengelola Link Hub dari unit kerja Anda.',
-                ], 403));
+                abort(response()->json(['success' => false, 'message' => 'Anda hanya bisa mengelola Link Hub dari unit kerja Anda.'], 403));
             }
-
             return $linkHub;
         }
 
@@ -267,9 +247,7 @@ class LinkHubController extends Controller
             return LinkHub::where('id', $id)->firstOrFail();
         }
 
-        return LinkHub::where('id', $id)
-            ->where('user_id', $user->id)
-            ->firstOrFail();
+        return LinkHub::where('id', $id)->where('user_id', $user->id)->firstOrFail();
     }
 
     public function addItem(Request $request, $id)
@@ -285,14 +263,11 @@ class LinkHubController extends Controller
             'url.url' => 'URL yang dimasukkan tidak valid.',
         ]);
 
-        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
         $moderation = ContentModerationService::check($request->url);
-
         if ($moderation['blocked']) {
             return response()->json([
                 'success' => false,
-                'message' => 'URL yang Anda masukkan terdeteksi sebagai konten yang tidak diizinkan. '
-                    . 'PENINK melarang penambahan link ke situs judi online / pinjaman ilegal.',
+                'message' => 'URL yang Anda masukkan terdeteksi sebagai konten yang tidak diizinkan. PENINK melarang penambahan link ke situs judi online / pinjaman ilegal.',
                 'error_code' => 'blocked_content',
             ], 422);
         }
@@ -304,163 +279,65 @@ class LinkHubController extends Controller
             'status' => true,
         ]);
 
-        AuditLogService::log(
-            'linkhub.item.created',
-            'LinkHubItem',
-            $item->id,
-            'Link berhasil ditambahkan ke Link Hub',
-            [
-                'link_hub_id' => $linkHub->id,
-                'hub_title' => $linkHub->title,
-                'title' => $item->title,
-                'url' => $item->url,
-                'sort_order' => $item->sort_order,
-            ]
-        );
+        AuditLogService::log('linkhub.item.created', 'LinkHubItem', $item->id, 'Link berhasil ditambahkan ke Link Hub', ['link_hub_id' => $linkHub->id, 'hub_title' => $linkHub->title, 'title' => $item->title, 'url' => $item->url, 'sort_order' => $item->sort_order]);
 
-        return response()->json([
-            'message' => 'Link berhasil ditambahkan ke Link Hub.',
-            'data' => $item,
-        ], 201);
+        return response()->json(['message' => 'Link berhasil ditambahkan ke Link Hub.', 'data' => $item], 201);
     }
 
     public function updateItem(Request $request, $hubId, $itemId)
     {
         $linkHub = $this->findLinkHub($request, $hubId);
-
-        $item = $linkHub->items()
-            ->where('id', $itemId)
-            ->firstOrFail();
+        $item = $linkHub->items()->where('id', $itemId)->firstOrFail();
 
         $request->validate([
             'title' => 'required|string|max:255',
             'url' => 'required|url',
             'sort_order' => 'sometimes|integer|min:0',
-        ], [
-            'title.required' => 'Judul link wajib diisi.',
-            'url.required' => 'URL link wajib diisi.',
-            'url.url' => 'URL yang dimasukkan tidak valid.',
         ]);
 
-        // CEK KONTEN SENSITIF (JUDOL / PINJOL)
         $moderation = ContentModerationService::check($request->url);
-
         if ($moderation['blocked']) {
-            return response()->json([
-                'success' => false,
-                'message' => 'URL yang Anda masukkan terdeteksi sebagai konten yang tidak diizinkan. '
-                    . 'PENINK melarang penambahan link ke situs judi online / pinjaman ilegal.',
-                'error_code' => 'blocked_content',
-            ], 422);
+            return response()->json(['success' => false, 'message' => 'URL terdeteksi mengandung konten terlarang.', 'error_code' => 'blocked_content'], 422);
         }
 
         $item->update([
             'title' => $request->title,
             'url' => $request->url,
-            'sort_order' => $request->has('sort_order')
-                ? $request->sort_order
-                : $item->sort_order,
+            'sort_order' => $request->has('sort_order') ? $request->sort_order : $item->sort_order,
         ]);
 
-        AuditLogService::log(
-            'linkhub.item.updated',
-            'LinkHubItem',
-            $item->id,
-            'Link berhasil diperbarui',
-            [
-                'link_hub_id' => $linkHub->id,
-                'hub_title' => $linkHub->title,
-                'title' => $item->title,
-                'url' => $item->url,
-                'sort_order' => $item->sort_order,
-            ]
-        );
-
-        return response()->json([
-            'message' => 'Link berhasil diperbarui.',
-            'data' => $item,
-        ]);
+        return response()->json(['message' => 'Link berhasil diperbarui.', 'data' => $item]);
     }
 
     public function deleteItem(Request $request, $hubId, $itemId)
     {
         $linkHub = $this->findLinkHub($request, $hubId);
-
         $item = $linkHub->items()->where('id', $itemId)->firstOrFail();
-
-        $auditData = [
-            'link_hub_id' => $linkHub->id,
-            'hub_title' => $linkHub->title,
-            'title' => $item->title,
-            'url' => $item->url,
-            'sort_order' => $item->sort_order,
-            'status' => $item->status,
-        ];
+        $auditData = ['link_hub_id' => $linkHub->id, 'hub_title' => $linkHub->title, 'title' => $item->title, 'url' => $item->url];
 
         $item->delete();
+        AuditLogService::log('linkhub.item.deleted', 'LinkHubItem', $itemId, 'Link berhasil dihapus', $auditData);
 
-        AuditLogService::log(
-            'linkhub.item.deleted',
-            'LinkHubItem',
-            $itemId,
-            'Link berhasil dihapus',
-            $auditData
-        );
-
-        return response()->json([
-            'message' => 'Link berhasil dihapus.',
-        ]);
+        return response()->json(['message' => 'Link berhasil dihapus.']);
     }
 
     public function toggleItemStatus(Request $request, $hubId, $itemId)
     {
         $linkHub = $this->findLinkHub($request, $hubId);
-
-        $item = $linkHub->items()
-            ->where('id', $itemId)
-            ->firstOrFail();
+        $item = $linkHub->items()->where('id', $itemId)->firstOrFail();
 
         $item->status = !$item->status;
         $item->save();
 
-        AuditLogService::log(
-            'linkhub.item.status_changed',
-            'LinkHubItem',
-            $item->id,
-            $item->status
-                ? 'Link berhasil diaktifkan'
-                : 'Link berhasil dinonaktifkan',
-            [
-                'link_hub_id' => $linkHub->id,
-                'hub_title' => $linkHub->title,
-                'title' => $item->title,
-                'url' => $item->url,
-                'status' => $item->status,
-            ]
-        );
-
-        return response()->json([
-            'message' => $item->status
-                ? 'Link berhasil diaktifkan.'
-                : 'Link berhasil dinonaktifkan.',
-            'data' => $item,
-        ]);
+        return response()->json(['message' => $item->status ? 'Link berhasil diaktifkan.' : 'Link berhasil dinonaktifkan.', 'data' => $item]);
     }
 
     public function update(Request $request, $id)
     {
-        // PAKSA SHORT_CODE JADI LOWERCASE
-        if ($request->filled('short_code')) {
-            $request->merge([
-                'short_code' => strtolower($request->short_code),
-            ]);
-        }
-
+        // HAPUS PAKSA LOWERCASE
         $linkHub = $this->findLinkHub($request, $id);
 
-        // =====================================================
-        // VALIDASI DASAR — TANPA cek unique LinkHub & TANPA cek LockedAlias
-        // =====================================================
+        // VALIDASI DASAR (TANPA PAKSA LOWERCASE)
         $request->validate([
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
@@ -469,19 +346,15 @@ class LinkHubController extends Controller
                 'required',
                 'alpha_dash',
                 function ($attribute, $value, $fail) {
-                    $value = strtolower($value);
-
-                    $reservedAliases = [
-                        'admin', 'login', 'register', 'api',
-                        'dashboard', 'user', 'settings',
-                    ];
-
-                    if (in_array($value, $reservedAliases, true)) {
+                    $valueLower = strtolower($value);
+                    $reservedAliases = ['admin', 'login', 'register', 'api', 'dashboard', 'user', 'settings'];
+                    
+                    if (in_array($valueLower, $reservedAliases, true)) {
                         $fail('Alias ini tidak dapat digunakan karena termasuk alias yang dicadangkan.');
                         return;
                     }
-
-                    if (ShortLink::where('short_code', $value)->exists()) {
+                    // Cek Case-Sensitive ke tabel ShortLink
+                    if (ShortLink::whereRaw('BINARY short_code = ?', [$value])->exists()) {
                         $fail('Alias tersebut sudah digunakan oleh Short Link. Silakan pilih alias lain.');
                     }
                 },
@@ -489,149 +362,72 @@ class LinkHubController extends Controller
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
             'title.required' => 'Judul Link Hub wajib diisi.',
-            'short_code.required' => 'Alias Link Hub wajib diisi.',
-            'short_code.alpha_dash' => 'Alias hanya boleh berisi huruf, angka, tanda hubung (-), dan garis bawah (_).',
+            'short_code.required' => 'Alias Link Hub wajib diisi saat mengedit.',
             'type.required' => 'Jenis Link Hub wajib dipilih.',
-            'type.in' => 'Jenis Link Hub harus ASN atau UMUM.',
-            'locked_unit_kerja_id.exists' => 'Unit kerja yang dipilih tidak valid.',
         ]);
 
-        // =====================================================
-        // CEK MANUAL: Apakah alias bentrok dengan Link Hub LAIN?
-        // =====================================================
         $user = $request->user();
-        $alias = strtolower($request->short_code);
+        $alias = $request->short_code;
 
-        $existingHub = LinkHub::where('short_code', $alias)
+        // Cek manual bentrok dengan Link Hub lain
+        $existingHub = LinkHub::whereRaw('BINARY short_code = ?', [$alias])
             ->where('id', '!=', $linkHub->id)
             ->first();
 
         if ($existingHub) {
-            $locked = LockedAlias::where('alias', $alias)->first();
-            $userUnitKerjaId = $user->unit_kerja_id;
-
-            if ($locked) {
-                if ((int) $locked->unit_kerja_id === (int) $userUnitKerjaId) {
-                    return response()->json([
-                        'message' => 'Anda sudah memiliki Link Hub lain dengan alias ini.',
-                        'error_code' => 'alias_already_owned_by_you',
-                        'existing_id' => $existingHub->id,
-                    ], 400);
-                }
-
-                $namaOpd = $locked->unitKerja?->nama_unit_kerja ?? 'OPD lain';
-                return response()->json([
-                    'message' => "Alias '{$alias}' dikunci untuk {$namaOpd}. Silakan pakai alias lain.",
-                    'error_code' => 'alias_locked_to_other',
-                ], 400);
-            }
-
             return response()->json([
                 'message' => 'Alias Link Hub sudah digunakan.',
                 'error_code' => 'alias_taken',
             ], 400);
         }
 
-        // =====================================================
-        // LOLOS SEMUA CEK → UPDATE LINK HUB
-        // =====================================================
         $updateData = [
-    'title' => $request->title,
-    'description' => $request->description,
-    'short_code' => $alias,
-    'type' => $request->type,
-    'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
-];
+            'title' => $request->title,
+            'description' => $request->description,
+            'short_code' => $alias,
+            'type' => $request->type,
+            'locked_unit_kerja_id' => $request->locked_unit_kerja_id,
+        ];
 
-// Upload logo baru
-if ($request->hasFile('logo')) {
-    $request->validate([
-        'logo' => 'image|mimes:png,jpg,jpeg,svg,webp|max:2048',
-    ], [
-        'logo.image' => 'File harus berupa gambar.',
-        'logo.mimes' => 'Format logo harus PNG, JPG, JPEG, SVG, atau WEBP.',
-        'logo.max' => 'Ukuran logo maksimal 2MB.',
-    ]);
+        // Upload logo baru
+        if ($request->hasFile('logo')) {
+            $request->validate(['logo' => 'image|mimes:png,jpg,jpeg,svg,webp|max:2048']);
+            if ($linkHub->logo_path && Storage::disk('public')->exists($linkHub->logo_path)) {
+                Storage::disk('public')->delete($linkHub->logo_path);
+            }
+            $updateData['logo_path'] = $request->file('logo')->store('link-hub-logos', 'public');
+        }
 
-    // Hapus logo lama
-    if ($linkHub->logo_path && Storage::disk('public')->exists($linkHub->logo_path)) {
-        Storage::disk('public')->delete($linkHub->logo_path);
-    }
+        // Hapus logo
+        if ($request->input('remove_logo') === 'true') {
+            if ($linkHub->logo_path && Storage::disk('public')->exists($linkHub->logo_path)) {
+                Storage::disk('public')->delete($linkHub->logo_path);
+            }
+            $updateData['logo_path'] = null;
+        }
 
-    $updateData['logo_path'] = $request->file('logo')->store('link-hub-logos', 'public');
-}
-
-// Hapus logo (kembali ke default)
-if ($request->input('remove_logo') === 'true') {
-    if ($linkHub->logo_path && Storage::disk('public')->exists($linkHub->logo_path)) {
-        Storage::disk('public')->delete($linkHub->logo_path);
-    }
-    $updateData['logo_path'] = null;
-}
-
-$linkHub->update($updateData);
-
+        $linkHub->update($updateData);
         $linkHub->load('lockedUnitKerja');
 
-        AuditLogService::log(
-            'linkhub.updated',
-            'LinkHub',
-            $linkHub->id,
-            'Link Hub berhasil diperbarui',
-            [
-                'title' => $linkHub->title,
-                'short_code' => $linkHub->short_code,
-                'type' => $linkHub->type,
-                'locked_unit_kerja_id' => $linkHub->locked_unit_kerja_id,
-            ]
-        );
+        AuditLogService::log('linkhub.updated', 'LinkHub', $linkHub->id, 'Link Hub berhasil diperbarui', ['title' => $linkHub->title, 'short_code' => $linkHub->short_code]);
 
-        return response()->json([
-            'message' => 'Link Hub berhasil diperbarui.',
-            'data' => $linkHub,
-        ]);
+        return response()->json(['message' => 'Link Hub berhasil diperbarui.', 'data' => $linkHub]);
     }
 
     public function toggleStatus(Request $request, $id)
     {
         $linkHub = $this->findLinkHub($request, $id);
-
         $linkHub->status = !$linkHub->status;
         $linkHub->save();
 
-        AuditLogService::log(
-            'linkhub.status_changed',
-            'LinkHub',
-            $linkHub->id,
-            $linkHub->status
-                ? 'Link Hub berhasil diaktifkan'
-                : 'Link Hub berhasil dinonaktifkan',
-            [
-                'title' => $linkHub->title,
-                'short_code' => $linkHub->short_code,
-                'status' => $linkHub->status,
-            ]
-        );
-
-        return response()->json([
-            'message' => $linkHub->status
-                ? 'Link Hub berhasil diaktifkan.'
-                : 'Link Hub berhasil dinonaktifkan.',
-            'data' => $linkHub,
-        ]);
+        return response()->json(['message' => $linkHub->status ? 'Link Hub berhasil diaktifkan.' : 'Link Hub berhasil dinonaktifkan.', 'data' => $linkHub]);
     }
 
-        public function destroy(Request $request, $id)
+    public function destroy(Request $request, $id)
     {
         $linkHub = $this->findLinkHub($request, $id);
+        $auditData = ['title' => $linkHub->title, 'short_code' => $linkHub->short_code];
 
-        $auditData = [
-            'title' => $linkHub->title,
-            'short_code' => $linkHub->short_code,
-            'description' => $linkHub->description,
-        ];
-
-        // ✨ Hapus file logo dulu
         if ($linkHub->logo_path && Storage::disk('public')->exists($linkHub->logo_path)) {
             Storage::disk('public')->delete($linkHub->logo_path);
         }
@@ -639,68 +435,47 @@ $linkHub->update($updateData);
         $linkHub->items()->delete();
         $linkHub->delete();
 
-        AuditLogService::log(
-            'linkhub.deleted',
-            'LinkHub',
-            $id,
-            'Link Hub berhasil dihapus',
-            $auditData
-        );
+        AuditLogService::log('linkhub.deleted', 'LinkHub', $id, 'Link Hub berhasil dihapus', $auditData);
 
-        return response()->json([
-            'message' => 'Link Hub berhasil dihapus.',
-        ]);
+        return response()->json(['message' => 'Link Hub berhasil dihapus.']);
     }
 
-    /**
-     * Public show — menampilkan Link Hub untuk akses publik.
-     */
     public function publicShow(Request $request, $shortCode)
     {
+        // Pencarian harus Case-Sensitive
         $linkHub = LinkHub::with([
             'items' => function ($query) {
-                $query->where('status', true)
-                    ->orderBy('sort_order');
+                $query->where('status', true)->orderBy('sort_order');
             },
             'lockedUnitKerja',
         ])
-            ->where('short_code', $shortCode)
+            ->whereRaw('BINARY short_code = ?', [$shortCode])
             ->where('status', true)
             ->firstOrFail();
 
-        // Cek apakah link hub terkunci
         if ($linkHub->locked_unit_kerja_id) {
             $user = auth('sanctum')->user();
-
-            // Kalau tidak ada user (akses publik tanpa login)
             if (!$user) {
-                return response()->json([
-                    'message' => 'Link Hub ini terkunci. Silakan login terlebih dahulu.',
-                    'error_code' => 'login_required',
-                    'locked_unit_kerja' => $linkHub->lockedUnitKerja?->nama_unit_kerja,
-                ], 401);
+                return response()->json(['message' => 'Link Hub ini terkunci. Silakan login terlebih dahulu.', 'error_code' => 'login_required', 'locked_unit_kerja' => $linkHub->lockedUnitKerja?->nama_unit_kerja], 401);
             }
 
-            // Admin, super_admin, admin_unit → bypass
-            $isAdmin = in_array(
-                strtolower($user->role),
-                ['admin', 'super_admin', 'admin_unit']
-            );
+            $isAdmin = in_array(strtolower($user->role), ['admin', 'super_admin', 'admin_unit']);
             $isMatch = (int) $user->unit_kerja_id === (int) $linkHub->locked_unit_kerja_id;
 
             if (!$isMatch && !$isAdmin) {
-                return response()->json([
-                    'message' => 'Link Hub ini hanya dapat diakses oleh unit kerja: '
-                        . ($linkHub->lockedUnitKerja?->nama_unit_kerja ?? 'Tertentu'),
-                    'error_code' => 'forbidden',
-                    'locked_unit_kerja' => $linkHub->lockedUnitKerja?->nama_unit_kerja,
-                ], 403);
+                return response()->json(['message' => 'Link Hub ini hanya dapat diakses oleh unit kerja: ' . ($linkHub->lockedUnitKerja?->nama_unit_kerja ?? 'Tertentu'), 'error_code' => 'forbidden', 'locked_unit_kerja' => $linkHub->lockedUnitKerja?->nama_unit_kerja], 403);
             }
         }
 
-        return response()->json([
-            'message' => 'Link Hub berhasil diambil.',
-            'data' => $linkHub,
-        ]);
+        // ✨ TAMBAHKAN LOGIKA INCREMENT KLIK / SCAN ✨
+        $source = $request->query('source');
+        if ($source === 'qr') {
+            $linkHub->increment('scan_count');
+        } else {
+            $linkHub->increment('click_count');
+        }
+        $linkHub->refresh(); 
+
+        return response()->json(['message' => 'Link Hub berhasil diambil.', 'data' => $linkHub]);
     }
 }
