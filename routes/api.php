@@ -10,9 +10,21 @@ use App\Http\Controllers\Api\StatisticsApiController;
 use App\Http\Controllers\LinkHubController;
 use App\Http\Controllers\Api\FeedbackController;
 use App\Http\Controllers\Api\LockedAliasController;
+use App\Http\Controllers\Auth\ForgotPasswordController; 
 
+// =====================================================
+// RUTE LUPA PASSWORD
+// =====================================================
+Route::post('/forgot-password', [ForgotPasswordController::class, 'sendResetLinkEmail']);
 
+// ✨ TAMBAHKAN RUTE INI AGAR TIDAK ERROR "Route [password.reset] not defined" ✨
+Route::get('/reset-password/{token}', function ($token) {
+    return response()->json(['message' => 'Gunakan link ini di halaman frontend.']);
+})->name('password.reset');
 
+// =====================================================
+// RUTE AUTENTIKASI & USER
+// =====================================================
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user()->load('unitKerja');
 });
@@ -59,8 +71,11 @@ Route::middleware('auth:sanctum')->get(
 Route::get('/integration/statistics', [StatisticsApiController::class, 'index'])
     ->middleware('statistics.api.key');
 
+// =====================================================
+// RUTE TERPROTEKSI (HARUS LOGIN)
+// =====================================================
 Route::middleware('auth:sanctum')->group(function () {
-     Route::get('/short-links/{code}/resolve', [ShortLinkController::class, 'resolve']);
+    Route::get('/short-links/{code}/resolve', [ShortLinkController::class, 'resolve']);
     Route::get('/settings', [\App\Http\Controllers\Api\SettingController::class, 'index']);
     Route::post('/feedbacks', [FeedbackController::class, 'store']);
     
@@ -79,7 +94,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/profile/password', [AuthController::class, 'changePassword']);
 
     Route::middleware('throttle:shortlink-create')->group(function () {
-    Route::post('/short-links', [ShortLinkController::class, 'store']);});
+        Route::post('/short-links', [ShortLinkController::class, 'store']);
+    });
+    
     Route::get('/short-links', [ShortLinkController::class, 'index']);
     Route::get('/short-links/today-clicks', [ShortLinkController::class, 'todayClicks']);
     Route::get('/short-links/month-clicks', [ShortLinkController::class, 'monthClicks']);
@@ -90,6 +107,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/short-links/{id}/status', [ShortLinkController::class, 'toggleStatus']);
     Route::delete('/short-links/{id}', [ShortLinkController::class, 'destroy']);
 
+    // =====================================================
+    // RUTE ADMIN & SUPER ADMIN
+    // =====================================================
     Route::middleware('admin')->prefix('admin')->group(function () {
         Route::get('/users', [AdminUserController::class, 'index']);
         Route::post('/users', [AdminUserController::class, 'store']);
@@ -105,7 +125,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::patch('/short-links/{id}/status', [AdminUserController::class, 'toggleShortLink']);
         Route::delete('/short-links/{id}', [AdminUserController::class, 'deleteShortLink']);
 
-            Route::middleware('super_admin')->prefix('super')->group(function () {
+        Route::middleware('super_admin')->prefix('super')->group(function () {
             Route::get('/locked-aliases', [LockedAliasController::class, 'index']);
             Route::post('/locked-aliases', [LockedAliasController::class, 'store']);
             Route::delete('/locked-aliases/{id}', [LockedAliasController::class, 'destroy']);
@@ -113,9 +133,11 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::put('/settings/{key}', [\App\Http\Controllers\Api\SettingController::class, 'update']);
         });
     });
-
 });
 
+// =====================================================
+// RUTE OAUTH GOOGLE (TETAP ADA UNTUK JAGA-JAGA)
+// =====================================================
 Route::get('/auth/google', function () {
     return Socialite::driver('google')->redirect();
 })->middleware('web');

@@ -56,13 +56,9 @@ class ShortLinkController extends Controller
      */
     public function store(Request $request)
     {
-        // BLOK PAKSA LOWERCASE SUDAH DIHAPUS DI SINI
-
         $request->validate([
             'original_url' => 'required|url',
-
             'type' => 'required|in:ASN,UMUM',
-
             'short_code' => [
                 'nullable',
                 'alpha_dash',
@@ -71,17 +67,10 @@ class ShortLinkController extends Controller
                 function ($attribute, $value, $fail) {
                     if (!$value) return;
 
-                    // Tetap gunakan strtolower di validasi agar 'ADMIN' tidak bisa dipakai
                     $valueLower = strtolower($value);
 
                     $reservedAliases = [
-                        'admin',
-                        'login',
-                        'register',
-                        'api',
-                        'dashboard',
-                        'user',
-                        'settings',
+                        'admin', 'login', 'register', 'api', 'dashboard', 'user', 'settings',
                     ];
 
                     if (in_array($valueLower, $reservedAliases, true)) {
@@ -109,7 +98,6 @@ class ShortLinkController extends Controller
                     }
                 },
             ],
-
             'title' => 'nullable|string|max:255',
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
@@ -188,11 +176,21 @@ class ShortLinkController extends Controller
             ->whereRaw('BINARY short_code = ?', [$shortCode])
             ->first();
 
-        // 2. JIKA LINK TIDAK DITEMUKAN (Salah ketik / beda huruf besar-kecil)
-        // Lempar user ke halaman 404 Frontend React
+        // 2. JIKA LINK TIDAK DITEMUKAN
         if (!$shortLink) {
             $frontendUrl = env('FRONTEND_URL', 'http://localhost:5173');
-            return redirect()->away($frontendUrl . '/' . $shortCode);
+            
+            // Cek apakah request ini datang dari fallback Frontend
+            $isNotFound = $request->query('not_found') == '1';
+            
+            if ($isNotFound) {
+                // Jika dari fallback, kembalikan ke Frontend dengan parameter ?not_found=1
+                // agar React berhenti mencari dan menampilkan halaman 404
+                return redirect()->away($frontendUrl . '/' . $shortCode . '?not_found=1');
+            } else {
+                // Jika akses langsung ke Backend (port 8000), lempar ke Frontend
+                return redirect()->away($frontendUrl . '/' . $shortCode . '?not_found=1');
+            }
         }
 
         // 3. Cek status (Aktif / Nonaktif)
@@ -288,24 +286,36 @@ class ShortLinkController extends Controller
         ]);
     }
 
-    public function qrScans(Request $request)
+        public function qrScans(Request $request)
     {
-        $query = ShortLinkClick::where('source', 'qr');
-
+        $user = $request->user();
         $isAdmin = in_array(
-            strtolower($request->user()->role),
+            strtolower($user->role),
             ['admin', 'super_admin']
         );
 
+        // 1. Hitung scan dari Shortlink
+        $shortlinkQuery = ShortLinkClick::where('source', 'qr');
         if (!$isAdmin) {
-            $query->whereHas('shortLink', function ($query) use ($request) {
-                $query->where('user_id', $request->user()->id);
+            $shortlinkQuery->whereHas('shortLink', function ($query) use ($user) {
+                $query->where('user_id', $user->id);
             });
         }
+        $shortlinkScans = $shortlinkQuery->count();
+
+        // 2. Hitung scan dari Link Hub
+        $linkHubQuery = \App\Models\LinkHub::query();
+        if (!$isAdmin) {
+            $linkHubQuery->where('user_id', $user->id);
+        }
+        $linkHubScans = $linkHubQuery->sum('scan_count') ?? 0;
+
+        // 3. Total keseluruhan
+        $totalQrScans = $shortlinkScans + $linkHubScans;
 
         return response()->json([
             'message' => 'Total QR Scan berhasil diambil.',
-            'total_qr_scans' => $query->count(),
+            'total_qr_scans' => $totalQrScans,
         ]);
     }
 
@@ -363,8 +373,6 @@ class ShortLinkController extends Controller
      */
     public function update(Request $request, string $id)
     {
-        // BLOK PAKSA LOWERCASE SUDAH DIHAPUS DI SINI
-
         $shortLink = ShortLink::where('id', $id)
             ->where('user_id', auth()->id())
             ->firstOrFail();
@@ -391,7 +399,6 @@ class ShortLinkController extends Controller
                     }
                 },
             ],
-
             'title' => 'nullable|string|max:255',
             'locked_unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ], [
