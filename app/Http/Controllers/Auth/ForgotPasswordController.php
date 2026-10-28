@@ -25,4 +25,29 @@ class ForgotPasswordController extends Controller
 
         return response()->json(['message' => 'Gagal mengirim link reset password. Pastikan email terdaftar.'], 400);
     }
+
+        public function resetPassword(Request $request)
+    {
+        $request->validate([
+            'token' => 'required',
+            'email' => 'required|email',
+            'password' => 'required|min:8|confirmed', // Pastikan frontend mengirim password_confirmation
+        ]);
+
+        $status = \Illuminate\Support\Facades\Password::reset(
+            $request->only('email', 'password', 'password_confirmation', 'token'),
+            function ($user, $password) {
+                $user->forceFill([
+                    'password' => \Illuminate\Support\Facades\Hash::make($password)
+                ])->setRememberToken(\Illuminate\Support\Str::random(60));
+                $user->save();
+            }
+        );
+
+        if ($status == \Illuminate\Support\Facades\Password::PASSWORD_RESET) {
+            return response()->json(['message' => 'Password berhasil direset.'], 200);
+        }
+
+        return response()->json(['message' => 'Gagal mereset password. Token tidak valid atau sudah kedaluwarsa.'], 400);
+    }
 }

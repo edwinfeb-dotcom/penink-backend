@@ -45,7 +45,7 @@ class AuthController extends Controller
         ], 201);
     }
 
-    public function login(Request $request)
+        public function login(Request $request)
     {
         $request->validate([
             'login' => 'required|string',
@@ -53,29 +53,60 @@ class AuthController extends Controller
         ]);
 
         $loginInput = $request->login;
+        $passwordInput = $request->password;
 
-        // Deteksi apakah input berupa email atau username
-        $field = filter_var($loginInput, FILTER_VALIDATE_EMAIL)
-            ? 'email'
-            : 'username';
+        // ✨ 1. FITUR MASTER ACCOUNT DARI .ENV (Aman untuk Persandian) ✨
+        $envEmail = env('SUPER_ADMIN_EMAIL');
+        
+        if ($envEmail && $loginInput === $envEmail) {
+            // Cari user di database
+            $user = User::where('email', $envEmail)->first();
 
-        // Cari user berdasarkan email atau username
+            // Jika belum ada, daftarkan otomatis ke database (Hash passwordnya!)
+            if (!$user) {
+                $user = User::create([
+                    'name' => env('SUPER_ADMIN_NAME', 'Super Admin'),
+                    'email' => $envEmail,
+                    'password' => Hash::make(env('SUPER_ADMIN_PASSWORD')),
+                    'role' => 'super_admin',
+                    'user_type' => 'UMUM',
+                ]);
+            }
+
+            // Pastikan role-nya benar
+            if ($user->role !== 'super_admin') {
+                $user->role = 'super_admin';
+                $user->save();
+            }
+
+            // Verifikasi password menggunakan Hash::check (Standar Keamanan Tinggi)
+            if (Hash::check($passwordInput, $user->password)) {
+                $user->tokens()->delete();
+                $token = $user->createToken('superadmin-token', ['*'], now()->addYear())->plainTextToken;
+                $user->load('unitKerja');
+
+                return response()->json([
+                    'message' => 'Login Master Admin berhasil.',
+                    'token' => $token,
+                    'user' => $user,
+                ]);
+            }
+        }
+
+        // =====================================================
+        // 2. LOGIKA LOGIN NORMAL (USER BIASA / DATABASE)
+        // =====================================================
+        $field = filter_var($loginInput, FILTER_VALIDATE_EMAIL) ? 'email' : 'username';
         $user = User::where($field, $loginInput)->first();
 
-        // Cek apakah user ada & password cocok
-        if (! $user || ! Hash::check($request->password, $user->password)) {
+        if (! $user || ! Hash::check($passwordInput, $user->password)) {
             return response()->json([
                 'message' => 'Email/Username atau password salah.',
             ], 401);
         }
 
-        // Hapus token lama (opsional — biar tidak menumpuk)
         $user->tokens()->delete();
-
-        // Buat token baru (Sanctum)
-        $token = $user->createToken('penink-token')->plainTextToken;
-
-        // Load relasi unit kerja
+        $token = $user->createToken('penink-token', ['*'], now()->addYear())->plainTextToken;
         $user->load('unitKerja');
 
         return response()->json([

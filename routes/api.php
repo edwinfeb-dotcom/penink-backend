@@ -16,6 +16,7 @@ use App\Http\Controllers\Auth\ForgotPasswordController;
 // RUTE LUPA PASSWORD
 // =====================================================
 Route::post('/forgot-password', [ForgotPasswordController::class, 'sendResetLinkEmail']);
+Route::post('/reset-password', [ForgotPasswordController::class, 'resetPassword']);
 
 // ✨ TAMBAHKAN RUTE INI AGAR TIDAK ERROR "Route [password.reset] not defined" ✨
 Route::get('/reset-password/{token}', function ($token) {
