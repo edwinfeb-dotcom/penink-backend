@@ -7,6 +7,8 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Laravel\Socialite\Facades\Socialite;
+use Illuminate\Support\Facades\Mail;
+use App\Mail\OtpMail; // Sesuaikan jika kamu menaruhnya di App\Mail
 
 class AuthController extends Controller
 {
@@ -15,7 +17,8 @@ class AuthController extends Controller
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|email|unique:users,email',
-            'password' => 'required|min:8|confirmed',
+            // Tambahkan regex password ketat agar sesuai standar keamanan Persandian
+            'password' => ['required', 'min:8', 'confirmed', 'regex:/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/'],
             'user_type' => 'required|in:ASN,UMUM',
             'unit_kerja_id' => 'nullable|exists:unit_kerjas,id',
         ]);
@@ -30,6 +33,9 @@ class AuthController extends Controller
             ], 422);
         }
 
+        // Generate OTP 6 Digit
+        $otp = rand(100000, 999999);
+
         $user = User::create([
             'name' => $request->name,
             'email' => $request->email,
@@ -37,15 +43,100 @@ class AuthController extends Controller
             'unit_kerja_id' => $request->unit_kerja_id,
             'user_type' => $request->user_type,
             'role' => 'user',
+            'otp_code' => $otp,
+            'otp_expires_at' => now()->addMinutes(10), // OTP berlaku 10 menit
+            'is_verified' => false, // Belum terverifikasi
         ]);
 
+        // Kirim Email OTP
+        try {
+            Mail::to($user->email)->send(new OtpMail($otp, $user->name));
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => 'Registrasi berhasil, namun gagal mengirim email OTP. Silakan hubungi admin.',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+
         return response()->json([
-            'message' => 'Registrasi berhasil. Silakan login.',
-            'user' => $user,
+            'message' => 'Registrasi berhasil. Silakan cek email Anda untuk kode verifikasi 6 digit.',
+            'email' => $user->email
         ], 201);
     }
 
-        public function login(Request $request)
+        public function verifyOtp(Request $request)
+    {
+        $request->validate([
+            'email' => 'required|email',
+            'otp_code' => 'required|string|size:6'
+        ]);
+
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user) {
+            return response()->json(['message' => 'User tidak ditemukan'], 404);
+        }
+
+        // ✨ PERBAIKAN DI SINI: Ubah keduanya menjadi String lalu bandingkan ✨
+        if ((string)$user->otp_code !== (string)$request->otp_code) {
+            return response()->json(['message' => 'Kode OTP salah'], 400);
+        }
+
+        // Cek apakah kode kadaluarsa
+        if (now()->greaterThan($user->otp_expires_at)) {
+            return response()->json(['message' => 'Kode OTP sudah kadaluarsa, silakan minta kode baru'], 400);
+        }
+
+        // Jika berhasil, ubah status user menjadi terverifikasi
+        $user->update([
+            'is_verified' => true,
+            'otp_code' => null, 
+            'otp_expires_at' => null,
+            'email_verified_at' => now()
+        ]);
+
+        // Buat token login
+        $token = $user->createToken('auth_token')->plainTextToken;
+
+        return response()->json([
+            'message' => 'Verifikasi berhasil',
+            'token' => $token,
+            'user' => $user
+        ], 200);
+    }
+
+        public function resendOtp(Request $request)
+    {
+        $request->validate(['email' => 'required|email']);
+
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user) {
+            return response()->json(['message' => 'User tidak ditemukan'], 404);
+        }
+
+        if ($user->is_verified) {
+            return response()->json(['message' => 'Akun Anda sudah terverifikasi.'], 400);
+        }
+
+        // Generate OTP baru
+        $otp = rand(100000, 999999);
+
+        $user->update([
+            'otp_code' => $otp,
+            'otp_expires_at' => now()->addMinutes(10),
+        ]);
+
+        try {
+            Mail::to($user->email)->send(new OtpMail($otp, $user->name));
+        } catch (\Exception $e) {
+            return response()->json(['message' => 'Gagal mengirim email OTP.', 'error' => $e->getMessage()], 500);
+        }
+
+        return response()->json(['message' => 'Kode OTP baru telah dikirim ke email Anda.'], 200);
+    }
+
+    public function login(Request $request)
     {
         $request->validate([
             'login' => 'required|string',
@@ -59,10 +150,8 @@ class AuthController extends Controller
         $envEmail = env('SUPER_ADMIN_EMAIL');
         
         if ($envEmail && $loginInput === $envEmail) {
-            // Cari user di database
             $user = User::where('email', $envEmail)->first();
 
-            // Jika belum ada, daftarkan otomatis ke database (Hash passwordnya!)
             if (!$user) {
                 $user = User::create([
                     'name' => env('SUPER_ADMIN_NAME', 'Super Admin'),
@@ -70,16 +159,16 @@ class AuthController extends Controller
                     'password' => Hash::make(env('SUPER_ADMIN_PASSWORD')),
                     'role' => 'super_admin',
                     'user_type' => 'UMUM',
+                    'is_verified' => true, // Master admin otomatis verified
+                    'email_verified_at' => now(),
                 ]);
             }
 
-            // Pastikan role-nya benar
             if ($user->role !== 'super_admin') {
                 $user->role = 'super_admin';
                 $user->save();
             }
 
-            // Verifikasi password menggunakan Hash::check (Standar Keamanan Tinggi)
             if (Hash::check($passwordInput, $user->password)) {
                 $user->tokens()->delete();
                 $token = $user->createToken('superadmin-token', ['*'], now()->addYear())->plainTextToken;
@@ -103,6 +192,15 @@ class AuthController extends Controller
             return response()->json([
                 'message' => 'Email/Username atau password salah.',
             ], 401);
+        }
+
+        // 🛑 CEK APAKAH USER SUDAH VERIFIKASI OTP
+        if (!$user->is_verified) {
+            return response()->json([
+                'message' => 'Akun Anda belum diverifikasi. Silakan cek email untuk kode OTP.',
+                'is_unverified' => true,
+                'email' => $user->email
+            ], 403); // 403 Forbidden
         }
 
         $user->tokens()->delete();
@@ -129,6 +227,8 @@ class AuthController extends Controller
                 'password' => Hash::make(str()->random(32)),
                 'role' => 'user',
                 'user_type' => 'UMUM',
+                'is_verified' => true, // Google OAuth otomatis verified
+                'email_verified_at' => now(),
             ]);
         }
 

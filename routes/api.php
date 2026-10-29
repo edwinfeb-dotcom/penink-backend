@@ -35,6 +35,9 @@ Route::post('/login', [AuthController::class, 'login'])
 
 Route::post('/register', [AuthController::class, 'register'])
     ->middleware('throttle:register');
+Route::post('/verify-otp', [AuthController::class, 'verifyOtp'])
+    ->middleware('throttle:login'); // Gunakan throttle login agar aman dari brute-force
+Route::post('/resend-otp', [AuthController::class, 'resendOtp'])->middleware('throttle:login');
 
 Route::get('/public/link-hubs/{shortCode}', [LinkHubController::class, 'publicShow']);
 Route::get('/unit-kerjas', function () {

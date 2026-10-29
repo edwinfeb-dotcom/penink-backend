@@ -28,6 +28,9 @@ class User extends Authenticatable
         'unit_kerja_id',
         'role',
         'user_type',
+        'otp_code',         // <-- TAMBAHKAN INI
+        'otp_expires_at',   // <-- TAMBAHKAN INI
+        'is_verified', 
     ];
 
     /**
@@ -67,5 +70,10 @@ class User extends Authenticatable
     public function feedbacks()
     {
     return $this->hasMany(Feedback::class);
+    }
+
+        public function sendPasswordResetNotification($token)
+    {
+        $this->notify(new \App\Notifications\CustomResetPasswordNotification($token));
     }
 }
